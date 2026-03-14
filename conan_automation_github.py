@@ -57,31 +57,56 @@ _upload_server_url: str | None = None
 
 # ── Episode / movie number from filename ──────────────────────────────────────
 
-def parse_number_from_filename(filename: str) -> int | None:
+def parse_file_info(filename: str) -> tuple:
     """
-    Extract the episode/movie number from the original torrent filename.
-    Handles formats like:
-      [SubsPlease] Detective Conan - 1194 (1080p) [ABC].mkv
-      Detective Conan Movie 28 - One-Eyed Flashback [1080p].mkv
+    Auto-detect whether a file is a movie or episode, and extract the number.
+    Returns (number, is_movie).
+
+    Movie detection — any of these in the filename triggers movie mode:
+      "Movie" keyword:   "Detective Conan Movie 28 - ..."
+      OVA keyword:       "Detective Conan OVA 18 - ..."
+      "Film" keyword:    "Detective Conan Film 5 ..."
+      MOVIE_MODE env:    override forces movie=True for all files
+
+    Episode detection:
+      "Detective Conan - 1194 ..."  →  episode 1194
     """
     base = os.path.basename(filename)
 
-    # "Detective Conan - 1194" style  (episodes)
+    # MOVIE_MODE env var overrides per-file detection
+    if MOVIE_MODE:
+        # Try to pull a 1-3 digit movie number
+        m = re.search(r"\bMovie\s*[-\u2013]?\s*(\d{1,3})\b", base, re.IGNORECASE)
+        if not m:
+            m = re.search(r"\b(\d{1,3})\b", base)
+        num = int(m.group(1)) if m else None
+        return num, True
+
+    # ── Auto-detect movie from filename ───────────────────────────────────
+    # Check for Movie / OVA / Film keywords BEFORE the episode dash pattern
+    movie_kw = re.search(r"\b(Movie|Film|OVA)\b", base, re.IGNORECASE)
+    if movie_kw:
+        # Extract the number that follows the keyword, or any 1-3 digit number
+        m = re.search(
+            r"\b(?:Movie|Film|OVA)\s*[-\u2013]?\s*(\d{1,3})\b",
+            base, re.IGNORECASE
+        )
+        if not m:
+            m = re.search(r"\b(\d{1,3})\b", base)
+        num = int(m.group(1)) if m else None
+        return num, True
+
+    # ── Standard episode: "Detective Conan - 1194" ────────────────────────
     m = re.search(r"Detective Conan\s*[-\u2013]\s*(\d{3,4})\b", base, re.IGNORECASE)
     if m:
-        return int(m.group(1))
+        return int(m.group(1)), False
 
-    # "Detective Conan Movie 28" or "Movie - 28" style
-    m = re.search(r"\bMovie\s*[-\u2013]?\s*(\d{1,3})\b", base, re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-
-    # Last fallback: first 3-4 digit number in the basename
+    # Fallback: any 3-4 digit number → treat as episode
     m = re.search(r"\b(\d{3,4})\b", base)
     if m:
-        return int(m.group(1))
+        return int(m.group(1)), False
 
-    return None
+    return None, False
 
 
 def get_expected_episode() -> int:
@@ -310,15 +335,15 @@ def process_file(mkv_file: str):
     Process one .mkv — detect number from original filename, upload SS+HS.
     Returns (number, is_movie, hs_url, ss_url). Never raises.
     """
-    num = parse_number_from_filename(mkv_file)
-    is_movie = MOVIE_MODE
+    num, is_movie = parse_file_info(mkv_file)
 
     if num is None:
-        num = get_expected_episode()
-        print(f"  Could not parse number from filename — using calculated: {num}")
+        num      = get_expected_episode()
+        is_movie = MOVIE_MODE
+        print(f"  Could not parse from filename — using calculated: EP {num}")
     else:
         kind = "Movie" if is_movie else "Episode"
-        print(f"  {kind} {num} detected from: {os.path.basename(mkv_file)}")
+        print(f"  Auto-detected: {kind} {num}  ({os.path.basename(mkv_file)})")
 
     label    = f"m{num}" if is_movie else str(num)
     hs_url   = None
