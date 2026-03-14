@@ -178,39 +178,70 @@ def _esc(path: str) -> str:
     return p.replace(":", "\\:").replace("[", "\\[").replace("]", "\\]")
 
 
+def _remux_ok(path: str) -> bool:
+    """Return True if path exists and is at least 10 MB (not corrupt/empty)."""
+    return os.path.exists(path) and os.path.getsize(path) > 10 * 1024 * 1024
+
+
 def remux_to_mp4(input_file: str, label: str) -> str | None:
     """
-    Stream-copy .mkv → .mp4  (no re-encode, takes ~30 seconds).
-    DoodStream requires mp4; this fixes the SS 'not uploading' issue.
+    Remux .mkv -> .mp4 for SS upload. Three attempts, most-likely first.
+
+    Why not -c:s mov_text?
+      SubsPlease uses ASS subtitles. ASS cannot be stream-copied into MP4 --
+      ffmpeg always errors on this. We drop the subtitle stream every time.
+
+    Why -movflags +faststart?
+      Without it the MP4 moov atom ends up at the END of the file.
+      DoodStream requires moov at the START to process/stream the upload.
+      Without faststart the upload returns 200 but the video never processes.
+      This was the primary silent-failure cause for SS uploads.
+
+    Attempt 1 -- video copy + audio copy        (fastest, H.264 + AAC)
+    Attempt 2 -- video copy + audio re-encode   (handles Opus audio which
+                 cannot be stream-copied into MP4 -- newer SubsPlease releases)
+    Attempt 3 -- full re-encode H.264 + AAC     (nuclear fallback, always works)
     """
     output = f"conan_{label}_ss.mp4"
-    print(f"  Remuxing to mp4 for SS upload -> {output}")
-    cmd = [
-        "ffmpeg", "-y", "-i", input_file,
-        "-c:v", "copy", "-c:a", "copy",
-        "-c:s", "mov_text",          # convert subtitles to mp4-compatible format
-        output,
+
+    if os.path.exists(output):
+        os.remove(output)
+
+    print(f"  Remuxing MKV -> MP4 for SS -> {output}")
+
+    attempts = [
+        ("video+audio stream copy",         ["-c:v", "copy", "-c:a", "copy"]),
+        ("video copy + audio re-encode AAC",["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]),
+        ("full re-encode H.264 + AAC",      ["-c:v", "libx264", "-preset", "veryfast",
+                                             "-crf", "22", "-c:a", "aac", "-b:a", "192k"]),
     ]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
-        print(f"  Remux complete: {output}")
-        return output
-    except subprocess.CalledProcessError as e:
-        # Fallback: drop subtitle track (some mkv sub formats can't be remuxed)
-        print(f"  Remux with subs failed, retrying without subtitle track...", file=sys.stderr)
-        cmd_nosub = [
+
+    for desc, codec_flags in attempts:
+        if os.path.exists(output):
+            os.remove(output)
+
+        cmd = [
             "ffmpeg", "-y", "-i", input_file,
-            "-c:v", "copy", "-c:a", "copy",
-            "-sn",           # drop subtitle stream
+            *codec_flags,
+            "-sn",                      # always drop subs -- ASS cannot go into MP4
+            "-movflags", "+faststart",  # moov atom at front -- required by DoodStream
             output,
         ]
-        try:
-            subprocess.run(cmd_nosub, check=True, capture_output=True, text=True, timeout=600)
-            print(f"  Remux (no subs) complete: {output}")
+
+        print(f"  Remux attempt ({desc})...")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+
+        if result.returncode == 0 and _remux_ok(output):
+            size_mb = os.path.getsize(output) // (1024 * 1024)
+            print(f"  Remux OK ({size_mb} MB): {output}")
             return output
-        except subprocess.CalledProcessError as e2:
-            print(f"  Remux failed entirely:\n{e2.stderr[-500:]}", file=sys.stderr)
-            return None
+
+        print(f"  Remux failed [{desc}] rc={result.returncode}:", file=sys.stderr)
+        if result.stderr:
+            print(f"  {result.stderr[-600:]}", file=sys.stderr)
+
+    print(f"  All 3 remux attempts failed for {input_file}", file=sys.stderr)
+    return None
 
 
 def hardsub(input_file: str, label: str) -> str | None:
@@ -298,7 +329,7 @@ def upload_file(file_path: str, title: str, folder_id: str = "") -> str | None:
                     data["fld_id"] = folder_id
                 resp = requests.post(
                     server,
-                    files={"file": (os.path.basename(file_path), fh)},
+                    files={"file": (os.path.basename(file_path), fh, "video/mp4")},
                     data=data,
                     timeout=7200,
                 ).json()
