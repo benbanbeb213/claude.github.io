@@ -1,12 +1,8 @@
 name: Detective Conan — Auto Downloader
 
 on:
-  # Every Saturday between 7–9 AM Central Time
-  # CST = UTC-6  →  13:00 UTC
-  # CDT = UTC-5  →  12:00 UTC
-  # Running at 13:00 UTC covers both daylight-saving offsets
   schedule:
-    - cron: '0 13 * * 6'
+    - cron: '0 13 * * 6'   # Saturdays 13:00 UTC (covers CST/CDT)
 
   workflow_dispatch:
     inputs:
@@ -16,16 +12,17 @@ on:
         default: ''
 
       magnet_links:
-        description: |
-          Batch magnet links — one per line, or comma-separated.
-          When provided, Nyaa search is skipped entirely.
+        description: 'Batch magnet links — one per line or comma-separated'
         required: false
         default: ''
 
+      movie_mode:
+        description: 'Set to 1 to treat all files as movies instead of episodes'
+        required: false
+        default: '0'
+
       nyaa_uploader_url:
-        description: |
-          Optional Nyaa.si uploader profile URL
-          (e.g. https://nyaa.si/user/SubsPlease)
+        description: 'Optional Nyaa.si uploader URL (e.g. https://nyaa.si/user/SubsPlease)'
         required: false
         default: ''
 
@@ -35,14 +32,24 @@ on:
         default: ''
 
       hs_title:
-        description: 'Hard-sub title template  (use {ep} as placeholder)'
+        description: 'Episode hard-sub title template  (use {ep})'
         required: false
         default: 'Detective Conan - {ep} HS'
 
       ss_title:
-        description: 'Soft-sub title template  (use {ep} as placeholder)'
+        description: 'Episode soft-sub title template  (use {ep})'
         required: false
         default: 'Detective Conan - {ep} SS'
+
+      movie_hs_title:
+        description: 'Movie hard-sub title template  (use {num})'
+        required: false
+        default: 'Detective Conan Movie - {num} HS'
+
+      movie_ss_title:
+        description: 'Movie soft-sub title template  (use {num})'
+        required: false
+        default: 'Detective Conan Movie - {num} SS'
 
 env:
   BASE_EPISODE: '1193'
@@ -51,22 +58,19 @@ env:
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 240        # 4-hour hard cap
+    timeout-minutes: 240
 
     steps:
-      # ── Repo ────────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── System deps ─────────────────────────────────────────────────────
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y aria2 ffmpeg
 
-      # ── Python ──────────────────────────────────────────────────────────
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -75,19 +79,20 @@ jobs:
       - name: Install Python dependencies
         run: pip install requests beautifulsoup4
 
-      # ── Run automation ──────────────────────────────────────────────────
       - name: Run Conan automation
         run: python conan_automation_github.py
         env:
-          DOODSTREAM_API_KEY:  ${{ secrets.DOODSTREAM_API_KEY }}
-          HARD_SUB_FOLDER_ID:  ${{ secrets.HARD_SUB_FOLDER_ID }}
-          SOFT_SUB_FOLDER_ID:  ${{ secrets.SOFT_SUB_FOLDER_ID }}
-          HTML_FILE:           index.html
+          DOODSTREAM_API_KEY:   ${{ secrets.DOODSTREAM_API_KEY }}
+          HARD_SUB_FOLDER_ID:   ${{ secrets.HARD_SUB_FOLDER_ID }}
+          SOFT_SUB_FOLDER_ID:   ${{ secrets.SOFT_SUB_FOLDER_ID }}
+          HTML_FILE:            index.html
 
-          # ── Workflow dispatch inputs (empty string when scheduled) ──
-          EPISODE_OVERRIDE:    ${{ github.event.inputs.episode_override  || '' }}
-          MAGNET_LINKS:        ${{ github.event.inputs.magnet_links       || '' }}
-          NYAA_UPLOADER_URL:   ${{ github.event.inputs.nyaa_uploader_url  || '' }}
-          CUSTOM_SEARCH:       ${{ github.event.inputs.custom_search_query || '' }}
-          HS_TITLE_TPL:        ${{ github.event.inputs.hs_title           || 'Detective Conan - {ep} HS' }}
-          SS_TITLE_TPL:        ${{ github.event.inputs.ss_title           || 'Detective Conan - {ep} SS' }}
+          EPISODE_OVERRIDE:     ${{ github.event.inputs.episode_override    || '' }}
+          MAGNET_LINKS:         ${{ github.event.inputs.magnet_links         || '' }}
+          MOVIE_MODE:           ${{ github.event.inputs.movie_mode           || '0' }}
+          NYAA_UPLOADER_URL:    ${{ github.event.inputs.nyaa_uploader_url    || '' }}
+          CUSTOM_SEARCH:        ${{ github.event.inputs.custom_search_query  || '' }}
+          HS_TITLE_TPL:         ${{ github.event.inputs.hs_title             || 'Detective Conan - {ep} HS' }}
+          SS_TITLE_TPL:         ${{ github.event.inputs.ss_title             || 'Detective Conan - {ep} SS' }}
+          MOVIE_HS_TITLE_TPL:   ${{ github.event.inputs.movie_hs_title       || 'Detective Conan Movie - {num} HS' }}
+          MOVIE_SS_TITLE_TPL:   ${{ github.event.inputs.movie_ss_title       || 'Detective Conan Movie - {num} SS' }}
