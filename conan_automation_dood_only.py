@@ -39,8 +39,8 @@ from update import patch_hs, patch_ss, patch_movie_hs, patch_movie_ss, read_html
 # ══════════════════════════════════════════════════════════════════════════════
 
 DOODSTREAM_API_KEY  = os.environ.get("DOODSTREAM_API_KEY", "554366xrjxeza9m7e4m02v")
-HARD_SUB_FOLDER_ID  = os.environ.get("HARD_SUB_FOLDER_ID", "thzdkzl93o")
-SOFT_SUB_FOLDER_ID  = os.environ.get("SOFT_SUB_FOLDER_ID", "5g3dhh9hmi")
+HARD_SUB_FOLDER_ID  = os.environ.get("HARD_SUB_FOLDER_ID", "")
+SOFT_SUB_FOLDER_ID  = os.environ.get("SOFT_SUB_FOLDER_ID", "")
 
 BASE_EPISODE        = int(os.environ.get("BASE_EPISODE", "1193"))
 BASE_DATE           = os.environ.get("BASE_DATE", "2026-03-14")
