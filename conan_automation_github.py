@@ -1,37 +1,34 @@
 """
-conan_automation_github.py — Detective Conan Ultimate Studio Automation
+conan_automation_dood_only.py — Detective Conan Single DoodStream Automation
 
 Upload routing:
-  Soft Sub (SS) → StreamP2P  via TUS protocol  (original .mkv, no re-encode)
-  Hard Sub (HS) → DoodStream  via HTTP upload   (ffmpeg-burned .mp4)
+  Soft Sub (SS) → DoodStream  (remuxed .mp4 with faststart, no re-encode)
+  Hard Sub (HS) → DoodStream  (ffmpeg-burned .mp4, English subs auto-selected)
 
-Downloader improvements:
-  • 6 Nyaa search strategies tried in order before giving up
-  • DHT + PEX + LPD enabled for better peer discovery
-  • Recursive .mkv detection across subdirectories
-  • Per-file timeout + graceful partial-file recovery
-
-All prior features preserved:
+All features:
   • Episode range parsing  (1000 / 1000-1005 / 1000,1005 / mixed)
   • Batch magnet links
+  • Select specific files from a torrent  (e.g. file 32 out of 100)
   • Auto movie/episode detection from filename
+  • English subtitle auto-selection via ffprobe
+  • 6 Nyaa search strategies before giving up
+  • DHT + PEX + LPD for better peer discovery
   • Single git commit+push at end of run
   • Per-file error isolation — 1 failure never kills the batch
-  • Upload retries with backoff
+  • Upload retries x3 with server URL refresh each attempt
 """
 
 import os
 import re
 import sys
 import glob
+import json
 import time
-import base64
 import subprocess
 from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup
-from tusclient import client as tus_client
 
 from conan_utils import xor_encrypt
 from update import patch_hs, patch_ss, patch_movie_hs, patch_movie_ss, read_html, write_html
@@ -41,26 +38,20 @@ from update import patch_hs, patch_ss, patch_movie_hs, patch_movie_ss, read_html
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-# DoodStream — Hard Subs only
 DOODSTREAM_API_KEY  = os.environ.get("DOODSTREAM_API_KEY", "554366xrjxeza9m7e4m02v")
 HARD_SUB_FOLDER_ID  = os.environ.get("HARD_SUB_FOLDER_ID", "")
+SOFT_SUB_FOLDER_ID  = os.environ.get("SOFT_SUB_FOLDER_ID", "")
 
-# StreamP2P — Soft Subs only
-STREAMP2P_API_KEY   = os.environ.get("STREAMP2P_API_KEY", "2a82d855a5801d4f32c498f8")
-
-# Episode tracking
 BASE_EPISODE        = int(os.environ.get("BASE_EPISODE", "1193"))
 BASE_DATE           = os.environ.get("BASE_DATE", "2026-03-14")
 
-# Input controls
 EPISODE_OVERRIDE    = os.environ.get("EPISODE_OVERRIDE",   "").strip()
 MAGNET_LINKS        = os.environ.get("MAGNET_LINKS",        "").strip()
 CUSTOM_SEARCH       = os.environ.get("CUSTOM_SEARCH",       "").strip()
 NYAA_UPLOADER_URL   = os.environ.get("NYAA_UPLOADER_URL",   "").strip()
 MOVIE_MODE          = os.environ.get("MOVIE_MODE", "0").strip() == "1"
-SELECT_FILES        = os.environ.get("SELECT_FILES", "").strip()  # e.g. "32" / "32-35" / "32,40"
+SELECT_FILES        = os.environ.get("SELECT_FILES", "").strip()
 
-# DoodStream title templates  — {ep} or {num}
 HS_TITLE_TPL        = os.environ.get("HS_TITLE_TPL",       "Detective Conan - {ep} HS")
 SS_TITLE_TPL        = os.environ.get("SS_TITLE_TPL",       "Detective Conan - {ep} SS")
 MOVIE_HS_TITLE_TPL  = os.environ.get("MOVIE_HS_TITLE_TPL", "Detective Conan Movie - {num} HS")
@@ -69,10 +60,9 @@ MOVIE_SS_TITLE_TPL  = os.environ.get("MOVIE_SS_TITLE_TPL", "Detective Conan Movi
 HTML_FILE           = os.environ.get("HTML_FILE", "index.html")
 
 UPLOAD_RETRIES      = 3
-RETRY_DELAY         = 15        # seconds between retries
-TUS_CHUNK_SIZE      = 52_428_800  # 50 MB chunks for StreamP2P TUS
+RETRY_DELAY         = 15
 
-_dood_server_url    = None      # cached DoodStream upload server URL
+_dood_server_url    = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -83,10 +73,8 @@ def parse_file_info(filename: str) -> tuple:
     """
     Auto-detect episode vs movie and extract the number from the filename.
     Returns (number, is_movie).
-
-    Movie keywords:  Movie, Film, OVA  anywhere in the filename
-    Episode pattern: Detective Conan - 1194 (3–4 digit number after dash)
-    MOVIE_MODE=1:    forces all files to be treated as movies
+    Movie keywords: Movie, Film, OVA anywhere in the filename.
+    MOVIE_MODE=1 forces all files to be treated as movies.
     """
     base = os.path.basename(filename)
 
@@ -120,13 +108,12 @@ def get_auto_episode() -> int:
 
 def parse_episode_override(raw: str) -> list:
     """
-    Parse EPISODE_OVERRIDE into a sorted, deduplicated list of episode numbers.
-
-      "1000"              → [1000]
-      "1000-1005"         → [1000, 1001, 1002, 1003, 1004, 1005]
-      "1000,1005"         → [1000, 1005]
-      "1000,1003-1005"    → [1000, 1003, 1004, 1005]
-      ""                  → [auto-calculated this week's episode]
+    Parse EPISODE_OVERRIDE into a deduplicated list of episode numbers.
+      "1000"           -> [1000]
+      "1000-1005"      -> [1000..1005]
+      "1000,1005"      -> [1000, 1005]
+      "1000,1003-1005" -> [1000, 1003, 1004, 1005]
+      ""               -> [auto-calculated]
     """
     raw = raw.strip()
     if not raw:
@@ -150,10 +137,10 @@ def parse_episode_override(raw: str) -> list:
             try:
                 episodes.append(int(part))
             except ValueError:
-                print(f"  WARNING: bad episode '{part}' — skipped", file=sys.stderr)
+                print(f"  WARNING: bad value '{part}' — skipped", file=sys.stderr)
 
     if not episodes:
-        print("  WARNING: no valid episodes parsed — using auto", file=sys.stderr)
+        print("  WARNING: no valid episodes — using auto", file=sys.stderr)
         return [get_auto_episode()]
 
     seen, unique = set(), []
@@ -164,122 +151,14 @@ def parse_episode_override(raw: str) -> list:
     return unique
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# NYAA SEARCH  (6 strategies, most specific → broadest)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _nyaa_magnets(url: str) -> list:
-    """Fetch a Nyaa page and return all magnet links found."""
-    try:
-        resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"    Nyaa fetch error: {e}", file=sys.stderr)
-        return []
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    magnets = []
-    for row in soup.select("tr.success, tr.default"):
-        for a in row.find_all("a", href=True):
-            if a["href"].startswith("magnet:"):
-                magnets.append((row, a["href"]))
-    return magnets
-
-
-def _best_magnet(rows_magnets: list, prefer_1080: bool = True) -> str | None:
-    """From a list of (row, magnet) pairs, prefer 1080p rows, return first magnet."""
-    if not rows_magnets:
-        return None
-    if prefer_1080:
-        for row, mag in rows_magnets:
-            text = row.get_text()
-            if "1080" in text:
-                return mag
-    # fallback: just return the very first magnet found
-    return rows_magnets[0][1]
-
-
-def search_nyaa(episode: int) -> str | None:
-    """
-    Try 6 search strategies in order.  Returns the first magnet found.
-
-    Strategy priority:
-      1. Custom search query (if provided)
-      2. Custom uploader profile + episode number
-      3. SubsPlease user page  (most reliable for recent episodes)
-      4. Erai-raws user page
-      5. Global Nyaa search — anime-English category
-      6. Global Nyaa search — all categories (broadest fallback)
-    """
-    ep3  = str(episode).zfill(3)    # "001" – "999"
-    ep4  = str(episode)             # "1000"+"
-
-    base_uploader = NYAA_UPLOADER_URL.rstrip("/") if NYAA_UPLOADER_URL else ""
-
-    strategies = []
-
-    # 1 — custom search query
-    if CUSTOM_SEARCH:
-        q = requests.utils.quote(CUSTOM_SEARCH)
-        strategies.append(("Custom search", f"https://nyaa.si/?f=0&c=1_2&q={q}"))
-
-    # 2 — custom uploader profile
-    if base_uploader:
-        for q in [f"Detective+Conan+-+{ep4}", f"Detective+Conan+-+{ep3}"]:
-            strategies.append((f"Custom uploader ({q})", f"{base_uploader}?f=0&c=0_0&q={q}"))
-
-    # 3 — SubsPlease (default, best for recent)
-    for q in [f"Detective+Conan+-+{ep4}+1080p",
-              f"Detective+Conan+-+{ep3}+1080p",
-              f"Detective+Conan+-+{ep4}",
-              f"Detective+Conan+-+{ep3}"]:
-        strategies.append((f"SubsPlease ({q})",
-                            f"https://nyaa.si/user/subsplease?f=0&c=0_0&q={q}"))
-
-    # 4 — Erai-raws fallback
-    for q in [f"Detective+Conan+-+{ep4}+1080p",
-              f"Detective+Conan+-+{ep4}"]:
-        strategies.append((f"Erai-raws ({q})",
-                            f"https://nyaa.si/user/Erai-raws?f=0&c=0_0&q={q}"))
-
-    # 5 — Global anime-English category
-    for q in [f"Detective+Conan+-+{ep4}+1080p",
-              f"Detective+Conan+-+{ep4}"]:
-        strategies.append((f"Global anime-English ({q})",
-                            f"https://nyaa.si/?f=0&c=1_2&q={q}"))
-
-    # 6 — Absolute broadest fallback
-    strategies.append(("Global all-categories",
-                        f"https://nyaa.si/?f=0&c=0_0&q=Detective+Conan+{ep4}"))
-
-    for name, url in strategies:
-        print(f"  [{name}] {url}")
-        pairs = _nyaa_magnets(url)
-        mag   = _best_magnet(pairs, prefer_1080=True)
-        if mag:
-            print(f"  Found via: {name}")
-            return mag
-
-    print(f"  Episode {episode} not found on Nyaa after all strategies.", file=sys.stderr)
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DOWNLOADER  (aria2c with full BitTorrent options)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def parse_select_files(raw: str) -> str:
     """
     Parse SELECT_FILES into an aria2c --select-file= string.
-
-    Formats accepted (same style as episode override):
-      "32"         -> "32"        single file
-      "32-35"      -> "32-35"     range of files
-      "32,40"      -> "32,40"     specific files
-      "32,40-42"   -> "32,40-42"  mixed
-      ""           -> ""          blank = download all files
-
-    aria2c accepts this string directly, e.g. --select-file=32,40-42
+      "32"      -> "32"
+      "32-35"   -> "32-35"
+      "32,40"   -> "32,40"
+      "32,40-42"-> "32,40-42"
+      ""        -> ""  (download all)
     """
     raw = raw.strip()
     if not raw:
@@ -293,8 +172,7 @@ def parse_select_files(raw: str) -> str:
         if "-" in part:
             halves = part.split("-", 1)
             try:
-                start = int(halves[0].strip())
-                end   = int(halves[1].strip())
+                start, end = int(halves[0].strip()), int(halves[1].strip())
                 if start > end:
                     start, end = end, start
                 parts.append(f"{start}-{end}")
@@ -309,23 +187,79 @@ def parse_select_files(raw: str) -> str:
     return ",".join(parts)
 
 
-def download_magnet(magnet: str, select_files: str = "") -> list:
-    """
-    Download a magnet with aria2c.
-    Returns list of all new .mkv files found afterwards (recursive).
+# ══════════════════════════════════════════════════════════════════════════════
+# NYAA SEARCH  (6 strategies, most specific → broadest)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    Key flags explained:
-      --seed-time=0             stop seeding immediately after download
-      --bt-enable-lpd           Local Peer Discovery  (finds peers on LAN)
-      --enable-dht              Distributed Hash Table (finds peers without tracker)
-      --enable-peer-exchange    PEX — peers share peer lists with each other
-      --bt-request-peer-speed-limit  caps how aggressively we ask for peers
-      --max-connection-per-server=8  more connections per source = faster
-      --min-split-size=5M       split files aggressively into parallel streams
-      --file-allocation=none    skip pre-allocation, start downloading immediately
-      --bt-stop-timeout=600     give up if stalled for 10 minutes
-      --disk-cache=64M          write buffering to reduce I/O overhead
-    """
+def _nyaa_magnets(url: str) -> list:
+    try:
+        resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"    Nyaa fetch error: {e}", file=sys.stderr)
+        return []
+    soup = BeautifulSoup(resp.text, "html.parser")
+    return [
+        (row, a["href"])
+        for row in soup.select("tr.success, tr.default")
+        for a in row.find_all("a", href=True)
+        if a["href"].startswith("magnet:")
+    ]
+
+
+def _best_magnet(rows_magnets: list) -> str | None:
+    if not rows_magnets:
+        return None
+    for row, mag in rows_magnets:
+        if "1080" in row.get_text():
+            return mag
+    return rows_magnets[0][1]
+
+
+def search_nyaa(episode: int) -> str | None:
+    ep3 = str(episode).zfill(3)
+    ep4 = str(episode)
+    base_uploader = NYAA_UPLOADER_URL.rstrip("/") if NYAA_UPLOADER_URL else ""
+
+    strategies = []
+
+    if CUSTOM_SEARCH:
+        strategies.append(("Custom search",
+            f"https://nyaa.si/?f=0&c=1_2&q={requests.utils.quote(CUSTOM_SEARCH)}"))
+
+    if base_uploader:
+        for q in [f"Detective+Conan+-+{ep4}", f"Detective+Conan+-+{ep3}"]:
+            strategies.append((f"Custom uploader", f"{base_uploader}?f=0&c=0_0&q={q}"))
+
+    for q in [f"Detective+Conan+-+{ep4}+1080p", f"Detective+Conan+-+{ep3}+1080p",
+              f"Detective+Conan+-+{ep4}", f"Detective+Conan+-+{ep3}"]:
+        strategies.append((f"SubsPlease", f"https://nyaa.si/user/subsplease?f=0&c=0_0&q={q}"))
+
+    for q in [f"Detective+Conan+-+{ep4}+1080p", f"Detective+Conan+-+{ep4}"]:
+        strategies.append((f"Erai-raws", f"https://nyaa.si/user/Erai-raws?f=0&c=0_0&q={q}"))
+
+    for q in [f"Detective+Conan+-+{ep4}+1080p", f"Detective+Conan+-+{ep4}"]:
+        strategies.append((f"Global anime-English", f"https://nyaa.si/?f=0&c=1_2&q={q}"))
+
+    strategies.append(("Global fallback",
+        f"https://nyaa.si/?f=0&c=0_0&q=Detective+Conan+{ep4}"))
+
+    for name, url in strategies:
+        print(f"  [{name}] {url}")
+        mag = _best_magnet(_nyaa_magnets(url))
+        if mag:
+            print(f"  Found via: {name}")
+            return mag
+
+    print(f"  Episode {episode} not found after all strategies.", file=sys.stderr)
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DOWNLOADER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def download_magnet(magnet: str, select_files: str = "") -> list:
     before = set(glob.glob("**/*.mkv", recursive=True))
     print(f"  Downloading: {magnet[:100]}...")
 
@@ -343,7 +277,7 @@ def download_magnet(magnet: str, select_files: str = "") -> list:
         "--file-allocation=none",
         "--bt-stop-timeout=600",
         "--disk-cache=64M",
-        "--summary-interval=60",    # print progress every 60 s
+        "--summary-interval=60",
         "--console-log-level=notice",
     ]
     if select_files:
@@ -354,17 +288,14 @@ def download_magnet(magnet: str, select_files: str = "") -> list:
     try:
         subprocess.run(cmd, check=True, timeout=7200)
     except subprocess.TimeoutExpired:
-        print("  aria2c: 2-hour timeout reached — checking for completed files",
-              file=sys.stderr)
+        print("  aria2c: timeout — checking for completed files", file=sys.stderr)
     except subprocess.CalledProcessError as e:
-        print(f"  aria2c exit code {e.returncode} — checking for completed files",
-              file=sys.stderr)
+        print(f"  aria2c exit {e.returncode} — checking for completed files", file=sys.stderr)
 
-    after  = set(glob.glob("**/*.mkv", recursive=True))
-    new    = sorted(after - before, key=os.path.getmtime)
+    after = set(glob.glob("**/*.mkv", recursive=True))
+    new   = sorted(after - before, key=os.path.getmtime)
+    valid = [f for f in new if os.path.getsize(f) > 50 * 1024 * 1024]
 
-    # Filter out tiny/corrupt files (< 50 MB is almost certainly incomplete)
-    valid  = [f for f in new if os.path.getsize(f) > 50 * 1024 * 1024]
     skipped = set(new) - set(valid)
     if skipped:
         print(f"  Skipped {len(skipped)} file(s) under 50 MB (likely incomplete):",
@@ -377,146 +308,12 @@ def download_magnet(magnet: str, select_files: str = "") -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STREAMP2P — Soft Sub uploader  (TUS protocol, original .mkv)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _streamp2p_video_url(data: dict) -> str:
-    """
-    Extract the watchable video URL from the StreamP2P initial API response.
-    Tries several common field names; falls back to constructing from accessToken.
-    """
-    # Direct fields the API might return
-    for field in ("embedUrl", "embed_url", "watchUrl", "watch_url",
-                  "videoUrl", "video_url", "url", "playUrl", "play_url"):
-        if data.get(field):
-            return data[field]
-
-    # Some APIs embed the video ID in the access token (JWT middle section)
-    access_token = data.get("accessToken", "")
-    if access_token:
-        # Try JWT payload decode (base64 middle part)
-        parts = access_token.split(".")
-        if len(parts) == 3:
-            try:
-                payload = parts[1] + "=="   # add padding
-                decoded = base64.urlsafe_b64decode(payload).decode("utf-8", errors="ignore")
-                import json
-                payload_data = json.loads(decoded)
-                for id_field in ("videoId", "video_id", "id", "vid"):
-                    if payload_data.get(id_field):
-                        return f"https://streamp2p.com/v/{payload_data[id_field]}"
-            except Exception:
-                pass
-
-    # Try to extract ID from TUS URL itself
-    tus_url = data.get("tusUrl", "")
-    if tus_url:
-        # TUS URLs often end in /uploads/{id} or /video/{id}
-        m = re.search(r"/(?:uploads?|videos?|files?)/([a-zA-Z0-9_\-]+)/?$", tus_url)
-        if m:
-            return f"https://streamp2p.com/v/{m.group(1)}"
-
-    # Return empty string — caller will log a warning
-    return ""
-
-
-def upload_to_streamp2p(file_path: str, title: str) -> str | None:
-    """
-    Upload file to StreamP2P via TUS protocol.
-
-    Steps:
-      1. GET /api/v1/video/upload  →  { tusUrl, accessToken, ... }
-      2. TUS upload the .mkv in 50 MB chunks
-      3. Extract and return the video embed/watch URL
-
-    Retries the full sequence up to UPLOAD_RETRIES times on failure.
-    The original .mkv is uploaded directly — no remux, no re-encode.
-    """
-    size_mb = os.path.getsize(file_path) // (1024 * 1024)
-    print(f"  [StreamP2P] Uploading '{title}' ({size_mb} MB)...")
-
-    for attempt in range(1, UPLOAD_RETRIES + 1):
-        try:
-            # ── Step 1: get TUS endpoint + access token ───────────────────
-            print(f"  [StreamP2P] Getting upload token (attempt {attempt})...")
-            init_resp = requests.get(
-                "https://streamp2p.com/api/v1/video/upload",
-                headers={
-                    "api-token": STREAMP2P_API_KEY,
-                    "Accept":    "application/json",
-                },
-                timeout=30,
-            )
-
-            print(f"  [StreamP2P] Init status: {init_resp.status_code}")
-
-            if init_resp.status_code != 200:
-                print(f"  [StreamP2P] Init failed: {init_resp.text[:300]}", file=sys.stderr)
-                raise RuntimeError(f"Init HTTP {init_resp.status_code}")
-
-            data         = init_resp.json()
-            print(f"  [StreamP2P] Init response keys: {list(data.keys())}")
-
-            tus_url      = data.get("tusUrl") or data.get("tus_url") or data.get("uploadUrl")
-            access_token = data.get("accessToken") or data.get("access_token") or ""
-
-            if not tus_url:
-                print(f"  [StreamP2P] No TUS URL in response: {data}", file=sys.stderr)
-                raise RuntimeError("No TUS URL")
-
-            print(f"  [StreamP2P] TUS URL: {tus_url}")
-
-            # ── Step 2: TUS upload ────────────────────────────────────────
-            filename = os.path.basename(file_path)
-            print(f"  [StreamP2P] Starting TUS upload: {filename}")
-
-            tc       = tus_client.TusClient(tus_url)
-            uploader = tc.uploader(
-                file_path=file_path,
-                chunk_size=TUS_CHUNK_SIZE,
-                metadata={
-                    "accessToken": access_token,
-                    "filename":    filename,
-                    "filetype":    "video/x-matroska",
-                },
-            )
-            uploader.upload()
-            print(f"  [StreamP2P] TUS upload complete")
-
-            # ── Step 3: extract video URL ─────────────────────────────────
-            video_url = _streamp2p_video_url(data)
-            if video_url:
-                print(f"  [StreamP2P] Video URL: {video_url}")
-                return video_url
-            else:
-                # Upload succeeded but we couldn't determine the URL.
-                # Log the full response so the user can check the dashboard.
-                print(f"  [StreamP2P] Upload OK but could not determine video URL.",
-                      file=sys.stderr)
-                print(f"  [StreamP2P] Full response: {data}", file=sys.stderr)
-                print(f"  [StreamP2P] Check your StreamP2P dashboard for the video.",
-                      file=sys.stderr)
-                # Return a placeholder so HTML patching is skipped (None = skip)
-                return None
-
-        except Exception as e:
-            print(f"  [StreamP2P] Attempt {attempt} failed: {e}", file=sys.stderr)
-            if attempt < UPLOAD_RETRIES:
-                print(f"  [StreamP2P] Retrying in {RETRY_DELAY}s...")
-                time.sleep(RETRY_DELAY)
-
-    print(f"  [StreamP2P] All {UPLOAD_RETRIES} attempts failed for '{title}'",
-          file=sys.stderr)
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DOODSTREAM — Hard Sub uploader
+# DOODSTREAM UPLOAD
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _get_dood_server() -> str | None:
     global _dood_server_url
-    _dood_server_url = None   # always refresh
+    _dood_server_url = None
     try:
         resp = requests.get(
             "https://doodapi.co/api/upload/server",
@@ -547,10 +344,7 @@ def _rename_dood(file_code: str, title: str) -> None:
 
 
 def upload_to_doodstream(file_path: str, title: str, folder_id: str = "") -> str | None:
-    """
-    Upload an .mp4 to DoodStream, then set its title via the rename API.
-    Returns the embed/download URL or None.
-    """
+    """Upload an .mp4 to DoodStream with retries. Returns URL or None."""
     size_mb = os.path.getsize(file_path) // (1024 * 1024)
     print(f"  [DoodStream] Uploading '{title}' ({size_mb} MB)...")
 
@@ -598,48 +392,82 @@ def upload_to_doodstream(file_path: str, title: str, folder_id: str = "") -> str
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FFMPEG — Hard Sub encoder
+# FFMPEG — SS remux + HS encoder
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _esc(path: str) -> str:
-    """Escape a file path for use inside ffmpeg subtitles= filter."""
     p = path.replace("\\", "\\\\").replace("'", "\\'")
     return p.replace(":", "\\:").replace("[", "\\[").replace("]", "\\]")
 
 
+def _remux_ok(path: str) -> bool:
+    return os.path.exists(path) and os.path.getsize(path) > 10 * 1024 * 1024
+
+
+def remux_to_mp4(input_file: str, label: str) -> str | None:
+    """
+    Remux .mkv -> .mp4 for SS upload. Three attempts, most-likely first.
+    Uses -movflags +faststart so DoodStream can process it immediately.
+    Drops subtitles since ASS can't go into MP4.
+    """
+    output = f"conan_{label}_ss.mp4"
+    if os.path.exists(output):
+        os.remove(output)
+
+    print(f"  Remuxing MKV -> MP4 for SS -> {output}")
+
+    attempts = [
+        ("video+audio stream copy",          ["-c:v", "copy", "-c:a", "copy"]),
+        ("video copy + audio re-encode AAC", ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]),
+        ("full re-encode H.264 + AAC",       ["-c:v", "libx264", "-preset", "veryfast",
+                                              "-crf", "22", "-c:a", "aac", "-b:a", "192k"]),
+    ]
+
+    for desc, codec_flags in attempts:
+        if os.path.exists(output):
+            os.remove(output)
+
+        cmd = [
+            "ffmpeg", "-y", "-i", input_file,
+            *codec_flags,
+            "-sn",                      # drop subs — ASS cannot go into MP4
+            "-movflags", "+faststart",  # moov atom at front — required by DoodStream
+            output,
+        ]
+
+        print(f"  Remux attempt ({desc})...")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+
+        if result.returncode == 0 and _remux_ok(output):
+            size_mb = os.path.getsize(output) // (1024 * 1024)
+            print(f"  Remux OK ({size_mb} MB): {output}")
+            return output
+
+        print(f"  Remux failed [{desc}] rc={result.returncode}:", file=sys.stderr)
+        if result.stderr:
+            print(f"  {result.stderr[-600:]}", file=sys.stderr)
+
+    print(f"  All 3 remux attempts failed for {input_file}", file=sys.stderr)
+    return None
+
+
 def _find_english_subtitle_index(input_file: str) -> int:
     """
-    Use ffprobe to scan all subtitle streams and return the 0-based index
-    of the first English one.
-
-    Returns the index (e.g. 0, 1, 2) so ffmpeg can use:
-      subtitles=file.mkv:si=<index>
-
-    Falls back to 0 (first track) if:
-      - ffprobe is not available
-      - no subtitle stream is tagged as English
-      - ffprobe errors out for any reason
+    Use ffprobe to find the English subtitle track index.
+    Returns the 0-based index within subtitle streams.
+    Falls back to 0 if English not found or ffprobe errors.
     """
     try:
         result = subprocess.run(
-            [
-                "ffprobe", "-v", "quiet",
-                "-print_format", "json",
-                "-show_streams",
-                "-select_streams", "s",   # subtitle streams only
-                input_file,
-            ],
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-select_streams", "s", input_file],
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
-            print("  [ffprobe] Non-zero exit — defaulting to subtitle index 0",
-                  file=sys.stderr)
+            print("  [ffprobe] Error — defaulting to subtitle index 0", file=sys.stderr)
             return 0
 
-        import json
-        data    = json.loads(result.stdout)
-        streams = data.get("streams", [])
-
+        streams = json.loads(result.stdout).get("streams", [])
         print(f"  [ffprobe] Found {len(streams)} subtitle stream(s):")
         for i, s in enumerate(streams):
             lang  = s.get("tags", {}).get("language", "und")
@@ -647,49 +475,42 @@ def _find_english_subtitle_index(input_file: str) -> int:
             codec = s.get("codec_name", "?")
             print(f"    [{i}] lang={lang}  codec={codec}  title={title}")
 
-        # First pass: exact "eng" tag
+        # Pass 1: exact language=eng tag
         for i, s in enumerate(streams):
-            lang = s.get("tags", {}).get("language", "").lower()
-            if lang == "eng":
-                print(f"  [ffprobe] Chose subtitle index {i} (language=eng)")
+            if s.get("tags", {}).get("language", "").lower() == "eng":
+                print(f"  [ffprobe] Chose index {i} (language=eng)")
                 return i
 
-        # Second pass: title contains "english" (some files tag it this way)
+        # Pass 2: "english" in the title tag
         for i, s in enumerate(streams):
             title = s.get("tags", {}).get("title", "").lower()
             if "english" in title or "eng" in title:
-                print(f"  [ffprobe] Chose subtitle index {i} (title contains english)")
+                print(f"  [ffprobe] Chose index {i} (title contains english)")
                 return i
 
-        print("  [ffprobe] No English subtitle found — defaulting to index 0",
-              file=sys.stderr)
+        print("  [ffprobe] No English track found — defaulting to index 0", file=sys.stderr)
         return 0
 
     except Exception as e:
-        print(f"  [ffprobe] Error: {e} — defaulting to subtitle index 0",
-              file=sys.stderr)
+        print(f"  [ffprobe] Error: {e} — defaulting to index 0", file=sys.stderr)
         return 0
 
 
 def hardsub(input_file: str, label: str) -> str | None:
     """
-    Burn subtitles into video using ffmpeg.
-    Automatically picks the English subtitle track via ffprobe.
-    Falls back to track 0 if English isn't found.
+    Burn English subtitles into video using ffmpeg.
+    Auto-selects the English track via ffprobe.
     Output: conan_{label}_hs.mp4
     """
     output    = f"conan_{label}_hs.mp4"
     sub_index = _find_english_subtitle_index(input_file)
-    print(f"  [ffmpeg] Hard-subbing with subtitle index {sub_index} -> {output}")
+    esc       = _esc(input_file)
+    print(f"  [ffmpeg] Hard-subbing subtitle index {sub_index} -> {output}")
 
-    esc = _esc(input_file)
-
-    # si= selects subtitle stream by index (0-based within subtitle streams)
     for vf in [
         f"subtitles='{esc}':si={sub_index}",
         f"subtitles={esc}:si={sub_index}",
-        # Final fallback: no si= (uses default track, in case si= causes issues)
-        f"subtitles='{esc}'",
+        f"subtitles='{esc}'",   # fallback without si=
         f"subtitles={esc}",
     ]:
         cmd = [
@@ -710,6 +531,8 @@ def hardsub(input_file: str, label: str) -> str | None:
 
     print(f"  [ffmpeg] Hard-sub FAILED for {label}", file=sys.stderr)
     return None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PER-FILE PROCESSING
 # ══════════════════════════════════════════════════════════════════════════════
@@ -718,11 +541,10 @@ def process_file(mkv_file: str):
     """
     Process one .mkv file end-to-end.
 
-      SS  →  upload original .mkv to StreamP2P (no re-encode)
-      HS  →  burn subs with ffmpeg → upload .mp4 to DoodStream
+      SS → remux .mkv to .mp4 (stream copy, no re-encode) → DoodStream
+      HS → ffmpeg burn English subs → .mp4 → DoodStream
 
-    Returns (num, is_movie, hs_url, ss_url).
-    Never raises — all exceptions are caught and logged.
+    Returns (num, is_movie, hs_url, ss_url). Never raises.
     """
     num, is_movie = parse_file_info(mkv_file)
 
@@ -737,20 +559,31 @@ def process_file(mkv_file: str):
     label   = f"m{num}" if is_movie else str(num)
     ss_url  = None
     hs_url  = None
+    ss_file = None
     hs_file = None
 
-    # ── Soft Sub: upload original .mkv directly to StreamP2P ─────────────
+    # ── Soft Sub: remux → DoodStream ─────────────────────────────────────
     try:
-        ss_title = MOVIE_SS_TITLE_TPL.format(num=num) if is_movie else SS_TITLE_TPL.format(ep=num)
-        ss_url   = upload_to_streamp2p(mkv_file, ss_title)
+        ss_file = remux_to_mp4(mkv_file, label)
+        if ss_file:
+            ss_title = MOVIE_SS_TITLE_TPL.format(num=num) if is_movie \
+                       else SS_TITLE_TPL.format(ep=num)
+            ss_url   = upload_to_doodstream(ss_file, ss_title, SOFT_SUB_FOLDER_ID)
+        else:
+            print("  SS skipped — remux failed", file=sys.stderr)
     except Exception as e:
         print(f"  SS exception: {e}", file=sys.stderr)
+    finally:
+        if ss_file and os.path.exists(ss_file):
+            try: os.remove(ss_file)
+            except OSError: pass
 
-    # ── Hard Sub: burn subs → .mp4 → DoodStream ──────────────────────────
+    # ── Hard Sub: burn subs → DoodStream ─────────────────────────────────
     try:
         hs_file = hardsub(mkv_file, label)
         if hs_file:
-            hs_title = MOVIE_HS_TITLE_TPL.format(num=num) if is_movie else HS_TITLE_TPL.format(ep=num)
+            hs_title = MOVIE_HS_TITLE_TPL.format(num=num) if is_movie \
+                       else HS_TITLE_TPL.format(ep=num)
             hs_url   = upload_to_doodstream(hs_file, hs_title, HARD_SUB_FOLDER_ID)
         else:
             print("  HS skipped — hardsub failed", file=sys.stderr)
@@ -758,16 +591,11 @@ def process_file(mkv_file: str):
         print(f"  HS exception: {e}", file=sys.stderr)
     finally:
         if hs_file and os.path.exists(hs_file):
-            try:
-                os.remove(hs_file)
-            except OSError:
-                pass
+            try: os.remove(hs_file)
+            except OSError: pass
 
-    # Source .mkv can be removed now — SS was uploaded directly from it
-    try:
-        os.remove(mkv_file)
-    except OSError:
-        pass
+    try: os.remove(mkv_file)
+    except OSError: pass
 
     return num, is_movie, hs_url, ss_url
 
@@ -878,13 +706,13 @@ def main() -> None:
         except Exception as e:
             print(f"  FATAL ERROR: {e}", file=sys.stderr)
 
-    # ── Patch HTML + git push (once for the whole batch) ───────────────────
+    # ── Patch HTML + git push once for the whole batch ─────────────────────
     if results:
         changed = patch_html_batch(results)
         if changed:
             git_commit_push(results)
 
-    # ── Run summary ────────────────────────────────────────────────────────
+    # ── Summary ────────────────────────────────────────────────────────────
     print("\n" + "="*60)
     print("RUN SUMMARY")
     print("="*60)
@@ -892,11 +720,11 @@ def main() -> None:
         kind = "Movie" if is_movie else "EP"
         ss   = "OK  " if ss_url else "FAIL"
         hs   = "OK  " if hs_url else "FAIL"
-        print(f"  {kind} {num:>4}  |  SS (StreamP2P): {ss}  |  HS (DoodStream): {hs}")
+        print(f"  {kind} {num:>4}  |  SS (DoodStream): {ss}  |  HS (DoodStream): {hs}")
 
     failed = [n for n, _m, hs, ss in results if not hs and not ss]
     if failed:
-        print(f"\n  Fully failed (no uploads at all): {failed}")
+        print(f"\n  Fully failed: {failed}")
         sys.exit(1)
     else:
         print(f"\n  All {len(results)} file(s) processed.")
