@@ -13,10 +13,11 @@ Features:
   - English subtitle auto-selection via ffprobe
   - External subtitle files (.srt/.ass) matched by episode number
   - 6 Nyaa search strategies before giving up
-  - DHT + PEX + LPD for better peer discovery
+  - SSL error recovery: verify=False fallback + HTTP fallback
+  - Chunked streaming upload for large files
   - Single git commit+push at end of run
   - Per-file error isolation - 1 failure never kills the batch
-  - Upload retries x3 with server URL refresh each attempt
+  - Upload retries x3 with fresh server URL each attempt
 """
 
 import os
@@ -25,14 +26,19 @@ import sys
 import glob
 import json
 import time
+import warnings
 import subprocess
 from datetime import datetime
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 
 from conan_utils import xor_encrypt
 from update import patch_hs, patch_ss, patch_movie_hs, patch_movie_ss, read_html, write_html
+
+# Suppress SSL warnings when we fall back to verify=False
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 # ==============================================================================
@@ -62,10 +68,10 @@ MOVIE_SS_TITLE_TPL  = os.environ.get("MOVIE_SS_TITLE_TPL", "Detective Conan Movi
 HTML_FILE           = os.environ.get("HTML_FILE", "index.html")
 
 UPLOAD_RETRIES      = 3
-RETRY_DELAY         = 15
+RETRY_DELAY         = 20         # seconds between upload retries
+CHUNK_SIZE          = 8 * 1024 * 1024   # 8 MB chunks for streaming upload
 
-_dood_server_url    = None
-SUB_MAP             = {}  # episode_number -> external subtitle file path
+SUB_MAP             = {}         # episode_number -> external subtitle file path
 
 
 # ==============================================================================
@@ -73,10 +79,7 @@ SUB_MAP             = {}  # episode_number -> external subtitle file path
 # ==============================================================================
 
 def parse_file_info(filename):
-    """
-    Auto-detect episode vs movie and extract the number from the filename.
-    Returns (number, is_movie).
-    """
+    """Returns (number, is_movie) detected from filename."""
     base = os.path.basename(filename)
 
     if MOVIE_MODE:
@@ -108,6 +111,14 @@ def get_auto_episode():
 
 
 def parse_episode_override(raw):
+    """
+    Parse episode range string into a deduplicated list.
+      "1000"           -> [1000]
+      "1000-1005"      -> [1000..1005]
+      "1000,1005"      -> [1000, 1005]
+      "1000,1003-1005" -> [1000, 1003, 1004, 1005]
+      ""               -> [auto-calculated]
+    """
     raw = raw.strip()
     if not raw:
         return [get_auto_episode()]
@@ -145,6 +156,7 @@ def parse_episode_override(raw):
 
 
 def parse_select_files(raw):
+    """Parse torrent file selection string for aria2c --select-file."""
     raw = raw.strip()
     if not raw:
         return ""
@@ -213,11 +225,14 @@ def search_nyaa(episode):
             strategies.append(("Custom uploader", f"{base_uploader}?f=0&c=0_0&q={q}"))
     for q in [f"Detective+Conan+-+{ep4}+1080p", f"Detective+Conan+-+{ep3}+1080p",
               f"Detective+Conan+-+{ep4}", f"Detective+Conan+-+{ep3}"]:
-        strategies.append(("SubsPlease", f"https://nyaa.si/user/subsplease?f=0&c=0_0&q={q}"))
+        strategies.append(("SubsPlease",
+            f"https://nyaa.si/user/subsplease?f=0&c=0_0&q={q}"))
     for q in [f"Detective+Conan+-+{ep4}+1080p", f"Detective+Conan+-+{ep4}"]:
-        strategies.append(("Erai-raws", f"https://nyaa.si/user/Erai-raws?f=0&c=0_0&q={q}"))
+        strategies.append(("Erai-raws",
+            f"https://nyaa.si/user/Erai-raws?f=0&c=0_0&q={q}"))
     for q in [f"Detective+Conan+-+{ep4}+1080p", f"Detective+Conan+-+{ep4}"]:
-        strategies.append(("Global anime-English", f"https://nyaa.si/?f=0&c=1_2&q={q}"))
+        strategies.append(("Global anime-English",
+            f"https://nyaa.si/?f=0&c=1_2&q={q}"))
     strategies.append(("Global fallback",
         f"https://nyaa.si/?f=0&c=0_0&q=Detective+Conan+{ep4}"))
 
@@ -236,18 +251,7 @@ def search_nyaa(episode):
 # DOWNLOADER
 # ==============================================================================
 
-def download_magnet(magnet, select_files=""):
-    """
-    Download a magnet with aria2c.
-    Returns (valid_mkv_files, external_subtitle_files).
-    """
-    sub_exts = (".srt", ".ass", ".ssa", ".sub", ".vtt")
-    before_mkv  = set(glob.glob("**/*.mkv", recursive=True))
-    before_subs = set(f for f in glob.glob("**/*", recursive=True)
-                      if os.path.splitext(f)[1].lower() in sub_exts)
-
-    print(f"  Downloading: {magnet[:100]}...")
-
+def _aria2c_run(magnet, select_files=""):
     cmd = [
         "aria2c",
         "--seed-time=0",
@@ -274,21 +278,37 @@ def download_magnet(magnet, select_files=""):
     except subprocess.TimeoutExpired:
         print("  aria2c: timeout - checking for completed files", file=sys.stderr)
     except subprocess.CalledProcessError as e:
-        print(f"  aria2c exit {e.returncode} - checking for completed files", file=sys.stderr)
+        print(f"  aria2c exit {e.returncode} - checking for completed files",
+              file=sys.stderr)
+
+
+def download_magnet(magnet, select_files=""):
+    """
+    Download a magnet with aria2c.
+    Returns (valid_mkv_files, external_subtitle_files).
+    """
+    sub_exts    = (".srt", ".ass", ".ssa", ".sub", ".vtt")
+    before_mkv  = set(glob.glob("**/*.mkv", recursive=True))
+    before_subs = set(f for f in glob.glob("**/*", recursive=True)
+                      if os.path.splitext(f)[1].lower() in sub_exts)
+
+    print(f"  Downloading: {magnet[:100]}...")
+    _aria2c_run(magnet, select_files)
 
     after_mkv  = set(glob.glob("**/*.mkv", recursive=True))
     after_subs = set(f for f in glob.glob("**/*", recursive=True)
                      if os.path.splitext(f)[1].lower() in sub_exts)
 
-    new_mkv  = sorted(after_mkv  - before_mkv,  key=os.path.getmtime)
-    new_subs = sorted(after_subs - before_subs)
+    new_mkv    = sorted(after_mkv  - before_mkv,  key=os.path.getmtime)
+    new_subs   = sorted(after_subs - before_subs)
 
-    valid_mkv  = [f for f in new_mkv  if os.path.getsize(f) > 50 * 1024 * 1024]
+    # Filter corrupt/incomplete files
+    valid_mkv  = [f for f in new_mkv  if os.path.getsize(f) > 50  * 1024 * 1024]
     valid_subs = [f for f in new_subs if os.path.getsize(f) > 100]
 
     skipped = set(new_mkv) - set(valid_mkv)
     if skipped:
-        print(f"  Skipped {len(skipped)} .mkv file(s) under 50 MB (likely incomplete):",
+        print(f"  Skipped {len(skipped)} .mkv file(s) under 50 MB:",
               file=sys.stderr)
         for f in skipped:
             print(f"    {f}  ({os.path.getsize(f) // 1024} KB)", file=sys.stderr)
@@ -305,7 +325,7 @@ def download_magnet(magnet, select_files=""):
 def download_subtitle_magnet(magnet):
     """
     Download a subtitle-only magnet.
-    Returns list of subtitle file paths found after download.
+    Returns list of subtitle file paths.
     """
     sub_exts = (".srt", ".ass", ".ssa", ".sub", ".vtt")
     before   = set(f for f in glob.glob("**/*", recursive=True)
@@ -331,13 +351,14 @@ def download_subtitle_magnet(magnet):
     try:
         subprocess.run(cmd, check=True, timeout=3600)
     except subprocess.TimeoutExpired:
-        print("  [Subtitle Magnet] Timeout - checking for completed files", file=sys.stderr)
+        print("  [Subtitle Magnet] Timeout - checking for completed files",
+              file=sys.stderr)
     except subprocess.CalledProcessError as e:
         print(f"  [Subtitle Magnet] aria2c exit {e.returncode} - checking files",
               file=sys.stderr)
 
-    after = set(f for f in glob.glob("**/*", recursive=True)
-                if os.path.splitext(f)[1].lower() in sub_exts)
+    after    = set(f for f in glob.glob("**/*", recursive=True)
+                   if os.path.splitext(f)[1].lower() in sub_exts)
     new_subs = sorted(after - before)
     valid    = [f for f in new_subs if os.path.getsize(f) > 100]
 
@@ -352,12 +373,11 @@ def download_subtitle_magnet(magnet):
 # ==============================================================================
 
 def _ep_from_path(path):
-    """Extract episode number from a filename, handling zero-padding."""
+    """Extract episode number from a filename (handles zero-padding like 0174)."""
     base = os.path.basename(path)
     m = re.search(r"Detective Conan\s*[-]\s*(\d{3,4})\b", base, re.IGNORECASE)
     if m:
         return int(m.group(1))
-    # Zero-padded 3-digit e.g. "0174" -> 174
     m = re.search(r"\b0*(\d{3,4})\b", base)
     if m:
         return int(m.group(1))
@@ -366,9 +386,9 @@ def _ep_from_path(path):
 
 def build_subtitle_map(sub_files):
     """
-    Build a dict mapping episode_number -> best subtitle file path.
+    Build episode_number -> best_subtitle_path map.
     Priority: .ass/.ssa > .srt > .sub > .vtt
-    English-tagged files are preferred over same-format untagged ones.
+    English-tagged files are preferred.
     """
     ext_priority = {".ass": 0, ".ssa": 1, ".srt": 2, ".sub": 3, ".vtt": 4}
     sub_map = {}  # ep -> (priority, path)
@@ -378,11 +398,11 @@ def build_subtitle_map(sub_files):
         if ep is None:
             continue
         ext  = os.path.splitext(path)[1].lower()
-        prio = ext_priority.get(ext, 99)
+        prio = float(ext_priority.get(ext, 99))
 
         base_lower = os.path.basename(path).lower()
         if "english" in base_lower or "_en" in base_lower or ".en." in base_lower:
-            prio -= 0.5
+            prio -= 0.5  # prefer English-tagged over same-format untagged
 
         if ep not in sub_map or prio < sub_map[ep][0]:
             sub_map[ep] = (prio, path)
@@ -400,82 +420,156 @@ def build_subtitle_map(sub_files):
 # ==============================================================================
 
 def _get_dood_server():
-    global _dood_server_url
-    _dood_server_url = None
-    try:
-        resp = requests.get(
-            "https://doodapi.co/api/upload/server",
-            params={"key": DOODSTREAM_API_KEY},
-            timeout=20,
-        ).json()
-        if resp.get("status") == 200:
-            _dood_server_url = resp["result"]
-            return _dood_server_url
-    except Exception as e:
-        print(f"  [DoodStream] Server lookup error: {e}", file=sys.stderr)
+    """Fetch a fresh upload server URL from the DoodStream API."""
+    for verify in [True, False]:
+        try:
+            resp = requests.get(
+                "https://doodapi.co/api/upload/server",
+                params={"key": DOODSTREAM_API_KEY},
+                timeout=20,
+                verify=verify,
+            ).json()
+            if resp.get("status") == 200:
+                return resp["result"]
+        except Exception as e:
+            if verify:
+                print(f"  [DoodStream] Server lookup SSL error, retrying without verify: {e}",
+                      file=sys.stderr)
+            else:
+                print(f"  [DoodStream] Server lookup error: {e}", file=sys.stderr)
     return None
 
 
 def _rename_dood(file_code, title):
-    try:
-        resp = requests.get(
-            "https://doodapi.co/api/file/rename",
-            params={"key": DOODSTREAM_API_KEY, "file_code": file_code, "title": title},
-            timeout=15,
-        ).json()
-        if resp.get("status") == 200:
-            print(f"  [DoodStream] Title set: '{title}'")
-        else:
-            print(f"  [DoodStream] Rename response: {resp}", file=sys.stderr)
-    except Exception as e:
-        print(f"  [DoodStream] Rename error: {e}", file=sys.stderr)
+    """Set the DoodStream file title via the rename API."""
+    for verify in [True, False]:
+        try:
+            resp = requests.get(
+                "https://doodapi.co/api/file/rename",
+                params={"key": DOODSTREAM_API_KEY,
+                        "file_code": file_code, "title": title},
+                timeout=15,
+                verify=verify,
+            ).json()
+            if resp.get("status") == 200:
+                print(f"  [DoodStream] Title set: '{title}'")
+            else:
+                print(f"  [DoodStream] Rename response: {resp}", file=sys.stderr)
+            return
+        except Exception as e:
+            if verify:
+                continue
+            print(f"  [DoodStream] Rename error: {e}", file=sys.stderr)
+
+
+def _do_upload(server_url, file_path, folder_id, verify=True):
+    """
+    Perform the actual HTTP POST upload to DoodStream.
+    Uses chunked streaming to handle large files without memory issues.
+    Returns the raw response object or None on error.
+    """
+    size = os.path.getsize(file_path)
+    basename = os.path.basename(file_path)
+
+    class _ChunkedFile:
+        """Wrap a file object to stream it in chunks."""
+        def __init__(self, fp):
+            self.fp   = fp
+            self.size = size
+        def __iter__(self):
+            while True:
+                chunk = self.fp.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                yield chunk
+        def __len__(self):
+            return self.size
+
+    upload_url = f"{server_url}?key={DOODSTREAM_API_KEY}"
+    data = {}
+    if folder_id:
+        data["fld_id"] = folder_id
+
+    with open(file_path, "rb") as fh:
+        files = {"file": (basename, _ChunkedFile(fh), "video/mp4")}
+        return requests.post(
+            upload_url,
+            files=files,
+            data=data,
+            timeout=14400,   # 4-hour timeout for very large files
+            verify=verify,
+            stream=False,
+        )
 
 
 def upload_to_doodstream(file_path, title, folder_id=""):
-    """Upload an .mp4 to DoodStream with retries. Returns URL or None."""
+    """
+    Upload a file to DoodStream with SSL error recovery.
+
+    SSL error handling:
+      Attempt 1: normal HTTPS with verify=True
+      Attempt 2: HTTPS with verify=False  (fixes SSLEOFError on CDN nodes)
+      Attempt 3: HTTP fallback            (some CDN nodes support both protocols)
+
+    Returns the embed/download URL or None.
+    """
     size_mb = os.path.getsize(file_path) // (1024 * 1024)
     print(f"  [DoodStream] Uploading '{title}' ({size_mb} MB)...")
 
     for attempt in range(1, UPLOAD_RETRIES + 1):
         server = _get_dood_server()
         if not server:
-            print(f"  [DoodStream] No server (attempt {attempt})", file=sys.stderr)
+            print(f"  [DoodStream] Could not get upload server (attempt {attempt})",
+                  file=sys.stderr)
             time.sleep(RETRY_DELAY)
             continue
 
-        try:
-            with open(file_path, "rb") as fh:
-                data = {}
-                if folder_id:
-                    data["fld_id"] = folder_id
-                raw = requests.post(
-                    f"{server}?key={DOODSTREAM_API_KEY}",
-                    files={"file": (os.path.basename(file_path), fh, "video/mp4")},
-                    data=data,
-                    timeout=7200,
-                )
+        # Three SSL strategies per attempt
+        ssl_strategies = [
+            ("HTTPS verify=True",  server,                   True),
+            ("HTTPS verify=False", server,                   False),
+            ("HTTP fallback",      server.replace("https://", "http://"), False),
+        ]
+
+        uploaded = False
+        for strategy_name, url, verify in ssl_strategies:
+            print(f"  [DoodStream] Attempt {attempt} via {strategy_name}...")
+            try:
+                raw = _do_upload(url, file_path, folder_id, verify=verify)
                 print(f"  [DoodStream] HTTP {raw.status_code}")
+
                 try:
                     resp = raw.json()
                 except Exception:
-                    print(f"  [DoodStream] Non-JSON response (attempt {attempt}): {raw.text[:300]}",
+                    print(f"  [DoodStream] Non-JSON response: {raw.text[:300]}",
                           file=sys.stderr)
                     resp = {}
 
-            if resp.get("status") == 200:
-                result    = resp["result"][0]
-                file_code = result.get("file_code") or result.get("filecode") or ""
-                url       = result.get("download_url") or result.get("embed_url") or ""
-                if file_code:
-                    _rename_dood(file_code, title)
-                print(f"  [DoodStream] Uploaded: {url}")
-                return url
-            else:
-                print(f"  [DoodStream] Bad response (attempt {attempt}): {resp}",
-                      file=sys.stderr)
+                if resp.get("status") == 200:
+                    result    = resp["result"][0]
+                    file_code = result.get("file_code") or result.get("filecode") or ""
+                    embed_url = result.get("download_url") or result.get("embed_url") or ""
+                    if file_code:
+                        _rename_dood(file_code, title)
+                    print(f"  [DoodStream] Uploaded: {embed_url}")
+                    return embed_url
+                else:
+                    print(f"  [DoodStream] Bad response ({strategy_name}): {resp}",
+                          file=sys.stderr)
+                    # Bad response from DoodStream - no point trying other SSL strategies
+                    break
 
-        except Exception as e:
-            print(f"  [DoodStream] Exception (attempt {attempt}): {e}", file=sys.stderr)
+            except Exception as e:
+                err_str = str(e)
+                if "SSL" in err_str or "EOF" in err_str or "ssl" in err_str:
+                    print(f"  [DoodStream] SSL error ({strategy_name}): {e}",
+                          file=sys.stderr)
+                    # Try next SSL strategy
+                    continue
+                else:
+                    print(f"  [DoodStream] Error ({strategy_name}): {e}",
+                          file=sys.stderr)
+                    break
 
         if attempt < UPLOAD_RETRIES:
             print(f"  [DoodStream] Retrying in {RETRY_DELAY}s...")
@@ -491,6 +585,7 @@ def upload_to_doodstream(file_path, title, folder_id=""):
 # ==============================================================================
 
 def _esc(path):
+    """Escape path for ffmpeg subtitles= filter."""
     p = path.replace("\\", "\\\\").replace("'", "\\'")
     return p.replace(":", "\\:").replace("[", "\\[").replace("]", "\\]")
 
@@ -501,9 +596,10 @@ def _remux_ok(path):
 
 def remux_to_mp4(input_file, label):
     """
-    Remux .mkv -> .mp4 for SS upload. Three attempts, most-likely first.
-    Uses -movflags +faststart so DoodStream can process it immediately.
-    Drops subtitles since ASS cannot go into MP4.
+    Remux .mkv -> .mp4 for SS upload.
+    - Drops subtitles (ASS cannot go into MP4)
+    - Uses -movflags +faststart (moov atom at front, required by DoodStream)
+    - Three attempts: stream copy first, then re-encode audio, then full re-encode
     """
     output = f"conan_{label}_ss.mp4"
     if os.path.exists(output):
@@ -512,10 +608,13 @@ def remux_to_mp4(input_file, label):
     print(f"  Remuxing MKV -> MP4 for SS -> {output}")
 
     attempts = [
-        ("video+audio stream copy",          ["-c:v", "copy", "-c:a", "copy"]),
-        ("video copy + audio re-encode AAC", ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]),
-        ("full re-encode H.264 + AAC",       ["-c:v", "libx264", "-preset", "veryfast",
-                                              "-crf", "22", "-c:a", "aac", "-b:a", "192k"]),
+        ("video+audio stream copy",
+         ["-c:v", "copy", "-c:a", "copy"]),
+        ("video copy + audio re-encode AAC",
+         ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]),
+        ("full re-encode H.264 + AAC",
+         ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+          "-c:a", "aac", "-b:a", "192k"]),
     ]
 
     for desc, codec_flags in attempts:
@@ -525,8 +624,8 @@ def remux_to_mp4(input_file, label):
         cmd = [
             "ffmpeg", "-y", "-i", input_file,
             *codec_flags,
-            "-sn",                      # drop subs - ASS cannot go into MP4
-            "-movflags", "+faststart",  # moov atom at front - required by DoodStream
+            "-sn",                      # drop subtitles
+            "-movflags", "+faststart",  # moov atom at front
             output,
         ]
 
@@ -538,18 +637,19 @@ def remux_to_mp4(input_file, label):
             print(f"  Remux OK ({size_mb} MB): {output}")
             return output
 
-        print(f"  Remux failed [{desc}] rc={result.returncode}:", file=sys.stderr)
+        print(f"  Remux failed [{desc}] rc={result.returncode}", file=sys.stderr)
         if result.stderr:
-            print(f"  {result.stderr[-600:]}", file=sys.stderr)
+            print(f"  {result.stderr[-400:]}", file=sys.stderr)
 
     print(f"  All 3 remux attempts failed for {input_file}", file=sys.stderr)
     return None
 
 
-def _find_english_subtitle_index(input_file):
+def _find_english_sub_index(input_file):
     """
     Use ffprobe to find the English subtitle track index.
-    Returns the 0-based index, or -1 if no subtitle streams exist at all.
+    Returns -1 if no subtitle streams exist (signals hardsub to skip).
+    Returns 0 as default if English not specifically found.
     """
     try:
         result = subprocess.run(
@@ -558,14 +658,13 @@ def _find_english_subtitle_index(input_file):
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
-            print("  [ffprobe] Error - defaulting to subtitle index 0", file=sys.stderr)
             return 0
 
         streams = json.loads(result.stdout).get("streams", [])
         print(f"  [ffprobe] Found {len(streams)} subtitle stream(s):")
 
         if not streams:
-            return -1  # signal to skip HS entirely
+            return -1  # no subtitle streams at all - skip HS
 
         for i, s in enumerate(streams):
             lang  = s.get("tags", {}).get("language", "und")
@@ -573,24 +672,24 @@ def _find_english_subtitle_index(input_file):
             codec = s.get("codec_name", "?")
             print(f"    [{i}] lang={lang}  codec={codec}  title={title}")
 
-        # Pass 1: exact language=eng tag
+        # Pass 1: exact lang=eng
         for i, s in enumerate(streams):
             if s.get("tags", {}).get("language", "").lower() == "eng":
                 print(f"  [ffprobe] Chose index {i} (language=eng)")
                 return i
 
-        # Pass 2: "english" in the title tag
+        # Pass 2: "english" in title tag
         for i, s in enumerate(streams):
-            title = s.get("tags", {}).get("title", "").lower()
-            if "english" in title or "eng" in title:
+            t = s.get("tags", {}).get("title", "").lower()
+            if "english" in t or "eng" in t:
                 print(f"  [ffprobe] Chose index {i} (title contains english)")
                 return i
 
-        print("  [ffprobe] No English track found - defaulting to index 0", file=sys.stderr)
+        print("  [ffprobe] No English track - defaulting to index 0", file=sys.stderr)
         return 0
 
     except Exception as e:
-        print(f"  [ffprobe] Error: {e} - defaulting to index 0", file=sys.stderr)
+        print(f"  [ffprobe] Error: {e} - defaulting to 0", file=sys.stderr)
         return 0
 
 
@@ -598,36 +697,31 @@ def hardsub(input_file, label, external_sub=None):
     """
     Burn subtitles into video using ffmpeg.
 
-    If external_sub is provided (.srt/.ass from the subtitle magnet or torrent),
-    it is used directly - no ffprobe scan needed.
-
-    Otherwise, ffprobe scans the .mkv for embedded subtitle streams and picks
-    the English one. Returns None if no subtitles available at all.
+    Priority:
+      1. external_sub (from subtitle magnet or torrent) - used directly
+      2. embedded subtitle stream - auto-selects English via ffprobe
+      3. Returns None if no subtitles available at all
 
     Output: conan_{label}_hs.mp4
     """
     output = f"conan_{label}_hs.mp4"
 
     if external_sub:
-        print(f"  [ffmpeg] Using external subtitle: {os.path.basename(external_sub)}")
-        esc_sub = _esc(external_sub)
-        vf_list = [
-            f"subtitles='{esc_sub}'",
-            f"subtitles={esc_sub}",
-        ]
+        print(f"  [ffmpeg] Using external sub: {os.path.basename(external_sub)}")
+        esc = _esc(external_sub)
+        vf_list = [f"subtitles='{esc}'", f"subtitles={esc}"]
     else:
-        sub_index = _find_english_subtitle_index(input_file)
-        if sub_index == -1:
-            print(f"  [ffmpeg] No subtitle streams in file - skipping HS",
-                  file=sys.stderr)
+        sub_idx = _find_english_sub_index(input_file)
+        if sub_idx == -1:
+            print("  [ffmpeg] No subtitle streams - skipping HS", file=sys.stderr)
             return None
-        esc_sub = _esc(input_file)
-        print(f"  [ffmpeg] Using embedded subtitle index {sub_index}")
+        esc = _esc(input_file)
+        print(f"  [ffmpeg] Using embedded subtitle index {sub_idx}")
         vf_list = [
-            f"subtitles='{esc_sub}':si={sub_index}",
-            f"subtitles={esc_sub}:si={sub_index}",
-            f"subtitles='{esc_sub}'",
-            f"subtitles={esc_sub}",
+            f"subtitles='{esc}':si={sub_idx}",
+            f"subtitles={esc}:si={sub_idx}",
+            f"subtitles='{esc}'",
+            f"subtitles={esc}",
         ]
 
     print(f"  [ffmpeg] Hard-subbing -> {output}")
@@ -644,12 +738,11 @@ def hardsub(input_file, label, external_sub=None):
         if result.returncode == 0 and size_mb > 10:
             print(f"  [ffmpeg] Hard-sub done ({size_mb} MB): {output}")
             return output
-        elif result.returncode == 0 and size_mb <= 10:
-            print(f"  [ffmpeg] Output too small ({size_mb} MB) - likely corrupt",
+        if result.returncode == 0 and size_mb <= 10:
+            print(f"  [ffmpeg] Output too small ({size_mb} MB) - corrupt",
                   file=sys.stderr)
-        print(f"  [ffmpeg] Attempt failed (rc={result.returncode}):", file=sys.stderr)
         if result.stderr:
-            print(f"  {result.stderr[-500:]}", file=sys.stderr)
+            print(f"  {result.stderr[-400:]}", file=sys.stderr)
 
     # Clean up partial output
     if os.path.exists(output):
@@ -667,9 +760,9 @@ def hardsub(input_file, label, external_sub=None):
 
 def process_file(mkv_file):
     """
-    Process one .mkv file end-to-end.
+    Process one .mkv end-to-end.
       SS -> remux .mkv to .mp4 (stream copy) -> DoodStream
-      HS -> ffmpeg burn English subs -> .mp4  -> DoodStream
+      HS -> ffmpeg burn English subs          -> DoodStream
     Returns (num, is_movie, hs_url, ss_url). Never raises.
     """
     num, is_movie = parse_file_info(mkv_file)
@@ -697,8 +790,8 @@ def process_file(mkv_file):
     try:
         ss_file = remux_to_mp4(mkv_file, label)
         if ss_file:
-            ss_title = MOVIE_SS_TITLE_TPL.format(num=num) if is_movie \
-                       else SS_TITLE_TPL.format(ep=num)
+            ss_title = (MOVIE_SS_TITLE_TPL.format(num=num) if is_movie
+                        else SS_TITLE_TPL.format(ep=num))
             ss_url   = upload_to_doodstream(ss_file, ss_title, SOFT_SUB_FOLDER_ID)
         else:
             print("  SS skipped - remux failed", file=sys.stderr)
@@ -715,8 +808,8 @@ def process_file(mkv_file):
     try:
         hs_file = hardsub(mkv_file, label, external_sub=ext_sub)
         if hs_file:
-            hs_title = MOVIE_HS_TITLE_TPL.format(num=num) if is_movie \
-                       else HS_TITLE_TPL.format(ep=num)
+            hs_title = (MOVIE_HS_TITLE_TPL.format(num=num) if is_movie
+                        else HS_TITLE_TPL.format(ep=num))
             hs_url   = upload_to_doodstream(hs_file, hs_title, HARD_SUB_FOLDER_ID)
         else:
             print("  HS skipped - no subtitles available", file=sys.stderr)
@@ -768,10 +861,13 @@ def git_commit_push(results):
     label     = ", ".join(sorted(ep_parts, key=int) + mov_parts) or "unknown"
 
     try:
-        subprocess.run(["git", "config", "user.email", "github-actions@github.com"], check=True)
-        subprocess.run(["git", "config", "user.name",  "GitHub Actions"],             check=True)
-        subprocess.run(["git", "add", HTML_FILE],                                     check=True)
-        subprocess.run(["git", "commit", "-m", f"chore: add links for {label}"],      check=True)
+        subprocess.run(["git", "config", "user.email",
+                        "github-actions@github.com"], check=True)
+        subprocess.run(["git", "config", "user.name",
+                        "GitHub Actions"], check=True)
+        subprocess.run(["git", "add", HTML_FILE], check=True)
+        subprocess.run(["git", "commit", "-m",
+                        f"chore: add links for {label}"], check=True)
         rebase = subprocess.run(["git", "pull", "--rebase"],
                                 capture_output=True, text=True)
         if rebase.returncode != 0:
@@ -783,17 +879,13 @@ def git_commit_push(results):
 
 
 # ==============================================================================
-# HELPERS
+# MAIN
 # ==============================================================================
 
 def parse_magnet_list(raw):
     sep = "\n" if "\n" in raw else ","
     return [m.strip() for m in raw.split(sep) if m.strip().startswith("magnet:")]
 
-
-# ==============================================================================
-# MAIN
-# ==============================================================================
 
 def main():
     global SUB_MAP
@@ -803,10 +895,10 @@ def main():
     # -- Step 0: download subtitle magnet first (if provided) --------------
     if SUBTITLE_MAGNET:
         print("\n-- Downloading subtitle magnet --")
-        subtitle_files = download_subtitle_magnet(SUBTITLE_MAGNET)
-        all_subs.extend(subtitle_files)
-        if subtitle_files:
-            print(f"  Subtitle magnet done - {len(subtitle_files)} file(s) ready")
+        sub_files = download_subtitle_magnet(SUBTITLE_MAGNET)
+        all_subs.extend(sub_files)
+        if sub_files:
+            print(f"  Subtitle magnet done - {len(sub_files)} file(s) ready")
         else:
             print("  WARNING: subtitle magnet produced no subtitle files",
                   file=sys.stderr)
@@ -817,9 +909,11 @@ def main():
         print(f"Batch mode: {len(magnets)} magnet(s) | Movie mode: {MOVIE_MODE}")
         for i, magnet in enumerate(magnets, 1):
             print(f"\n[{i}/{len(magnets)}] Downloading...")
-            new_files, new_subs = download_magnet(magnet, parse_select_files(SELECT_FILES))
+            new_files, new_subs = download_magnet(
+                magnet, parse_select_files(SELECT_FILES))
             if not new_files:
-                print("  No valid .mkv files - skipping this magnet", file=sys.stderr)
+                print("  No valid .mkv files - skipping this magnet",
+                      file=sys.stderr)
             else:
                 all_mkv.extend(new_files)
                 all_subs.extend(new_subs)
@@ -828,9 +922,11 @@ def main():
     else:
         episodes = parse_episode_override(EPISODE_OVERRIDE)
         if not EPISODE_OVERRIDE.strip():
-            print(f"Auto mode - episode {episodes[0]} (calculated) | Movie mode: {MOVIE_MODE}")
+            print(f"Auto mode - episode {episodes[0]} (calculated) "
+                  f"| Movie mode: {MOVIE_MODE}")
         else:
-            print(f"Episode mode - {len(episodes)} ep(s): {episodes} | Movie mode: {MOVIE_MODE}")
+            print(f"Episode mode - {len(episodes)} ep(s): {episodes} "
+                  f"| Movie mode: {MOVIE_MODE}")
 
         not_found = []
         for ep in episodes:
@@ -839,7 +935,8 @@ def main():
             if not magnet:
                 not_found.append(ep)
                 continue
-            new_files, new_subs = download_magnet(magnet, parse_select_files(SELECT_FILES))
+            new_files, new_subs = download_magnet(
+                magnet, parse_select_files(SELECT_FILES))
             if not new_files:
                 print(f"  No valid .mkv files for episode {ep}", file=sys.stderr)
             else:
@@ -853,7 +950,7 @@ def main():
         print("Nothing to process.")
         sys.exit(0)
 
-    # -- Build subtitle map from all collected external subs ---------------
+    # -- Build subtitle map ------------------------------------------------
     if all_subs:
         SUB_MAP = build_subtitle_map(all_subs)
 
@@ -883,7 +980,7 @@ def main():
         kind = "Movie" if is_movie else "EP"
         ss   = "OK  " if ss_url else "FAIL"
         hs   = "OK  " if hs_url else "FAIL"
-        print(f"  {kind} {num:>4}  |  SS (DoodStream): {ss}  |  HS (DoodStream): {hs}")
+        print(f"  {kind} {num:>4}  |  SS: {ss}  |  HS: {hs}")
 
     failed = [n for n, _m, hs, ss in results if not hs and not ss]
     if failed:
