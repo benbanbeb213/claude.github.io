@@ -356,6 +356,7 @@ def build_subtitle_map(sub_files):
 # ==============================================================================
 
 def _get_upload_server():
+    """GET /api/upload/server?key=  -> returns the upload URL for this session."""
     try:
         resp = requests.get(
             f"https://doodapi.co/api/upload/server?key={DOODSTREAM_API_KEY}",
@@ -370,6 +371,7 @@ def _get_upload_server():
 
 
 def _rename_dood(file_code, title):
+    """Set file title via /api/file/rename after upload."""
     try:
         resp = requests.get(
             f"https://doodapi.co/api/file/rename"
@@ -387,7 +389,18 @@ def _rename_dood(file_code, title):
 
 
 def upload_to_doodstream(file_path, title):
-    """Upload file to DoodStream. Returns embed URL or None."""
+    """
+    Upload a file to DoodStream following the official API docs format:
+
+      Step 1: GET /api/upload/server?key=API_KEY  -> get upload_url
+      Step 2: POST {upload_url}?API_KEY
+              form fields:  api_key=API_KEY
+              file field:   file=<binary>
+      Step 3: POST /api/file/rename  -> set the title
+
+    Returns the embed/download URL or None.
+    Retries UPLOAD_RETRIES times with a fresh server URL each attempt.
+    """
     size_mb = os.path.getsize(file_path) // (1024 * 1024)
     print(f"  [DoodStream] Uploading '{title}' ({size_mb} MB)...")
 
@@ -398,24 +411,22 @@ def upload_to_doodstream(file_path, title):
             time.sleep(RETRY_DELAY)
             continue
 
+        print(f"  [DoodStream] Attempt {attempt} -> {server}")
+
         try:
             with open(file_path, "rb") as fh:
-                raw = requests.post(
-                    f"{server}?key={DOODSTREAM_API_KEY}",
+                # Exact format from DoodStream API docs:
+                #   URL  = {server_url}?{api_key}   (raw key, no "key=" prefix)
+                #   data = {"api_key": api_key}
+                #   file = {"file": file_handle}
+                resp = requests.post(
+                    f"{server}?{DOODSTREAM_API_KEY}",
                     files={"file": (os.path.basename(file_path), fh, "video/mp4")},
+                    data={"api_key": DOODSTREAM_API_KEY},
                     timeout=7200,
-                )
+                ).json()
 
-            print(f"  [DoodStream] HTTP {raw.status_code}")
-
-            try:
-                resp = raw.json()
-            except Exception:
-                print(f"  [DoodStream] Non-JSON response: {raw.text[:300]}",
-                      file=sys.stderr)
-                if attempt < UPLOAD_RETRIES:
-                    time.sleep(RETRY_DELAY)
-                continue
+            print(f"  [DoodStream] Response status: {resp.get('status')}")
 
             if resp.get("status") == 200:
                 result    = resp["result"][0]
