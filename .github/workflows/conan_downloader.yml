@@ -1,0 +1,150 @@
+name: Detective Conan — Auto Downloader
+
+on:
+  # ── Scheduled: every Saturday 7–9 AM Central (13:00 UTC covers CST + CDT) ──
+  schedule:
+    - cron: '0 13 * * 6'
+
+  # ── Manual trigger ────────────────────────────────────────────────────────
+  workflow_dispatch:
+    inputs:
+
+      # ════════════════════════════════════════════════════════════════════
+      # SECTION 1 — MAGNETS
+      # Paste one or more magnet links here to skip Nyaa search entirely.
+      # One per line  OR  comma-separated.
+      # The script will auto-detect episode vs movie from each filename.
+      # ════════════════════════════════════════════════════════════════════
+      magnet_links:
+        description: |
+          [MAGNETS] Batch magnet links (one per line or comma-separated).
+          Auto-detects Movie vs Episode from each filename.
+          Leave blank to use auto Nyaa search instead.
+        required: false
+        default: ''
+
+      # ════════════════════════════════════════════════════════════════════
+      # SECTION 2 — EPISODES
+      # Controls for the weekly episode auto-download.
+      # Ignored when magnet_links is filled in.
+      # ════════════════════════════════════════════════════════════════════
+      episode_override:
+        description: |
+          [EPISODES] Force a specific episode number (e.g. 1194).
+          Leave blank to auto-calculate from the base date.
+        required: false
+        default: ''
+
+      nyaa_uploader_url:
+        description: |
+          [EPISODES] Custom Nyaa.si uploader profile URL.
+          Default: SubsPlease.  e.g. https://nyaa.si/user/Erai-raws
+        required: false
+        default: ''
+
+      custom_search_query:
+        description: |
+          [EPISODES] Override the Nyaa search query entirely.
+          e.g. "Detective Conan 1080p SubsPlease"
+        required: false
+        default: ''
+
+      ep_hs_title:
+        description: |
+          [EPISODES] Hard-sub DoodStream title template.
+          Use {ep} as the episode number placeholder.
+        required: false
+        default: 'Detective Conan - {ep} HS'
+
+      ep_ss_title:
+        description: |
+          [EPISODES] Soft-sub DoodStream title template.
+          Use {ep} as the episode number placeholder.
+        required: false
+        default: 'Detective Conan - {ep} SS'
+
+      # ════════════════════════════════════════════════════════════════════
+      # SECTION 3 — MOVIES
+      # Set movie_mode=1 when downloading movies via magnet_links
+      # so the script forces movie routing even if "Movie" isn't in the filename.
+      # Normally leave this blank — the script auto-detects from the filename.
+      # ════════════════════════════════════════════════════════════════════
+      movie_mode:
+        description: |
+          [MOVIES] Force all files to be treated as movies.
+          Set to 1 only if the filename doesn't contain "Movie"/"OVA"/"Film".
+          Leave blank for auto-detection (recommended).
+        required: false
+        default: '0'
+
+      movie_hs_title:
+        description: |
+          [MOVIES] Hard-sub DoodStream title template.
+          Use {num} as the movie number placeholder.
+        required: false
+        default: 'Detective Conan Movie - {num} HS'
+
+      movie_ss_title:
+        description: |
+          [MOVIES] Soft-sub DoodStream title template.
+          Use {num} as the movie number placeholder.
+        required: false
+        default: 'Detective Conan Movie - {num} SS'
+
+# ── Base config (edit here to update the episode counter baseline) ────────────
+env:
+  BASE_EPISODE: '1193'
+  BASE_DATE: '2026-03-14'
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240   # 4-hour hard cap for large batches
+
+    steps:
+
+      # ── 1. Repo ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 2. System deps ─────────────────────────────────────────────────
+      - name: Install system dependencies (aria2, ffmpeg)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y aria2 ffmpeg
+
+      # ── 3. Python ──────────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install requests beautifulsoup4
+
+      # ── 4. Run ────────────────────────────────────────────────────────
+      - name: Run Conan automation
+        run: python conan_automation_github.py
+        env:
+          # DoodStream credentials (set these in repo Settings → Secrets)
+          DOODSTREAM_API_KEY:   ${{ secrets.DOODSTREAM_API_KEY }}
+          HARD_SUB_FOLDER_ID:   ${{ secrets.HARD_SUB_FOLDER_ID }}
+          SOFT_SUB_FOLDER_ID:   ${{ secrets.SOFT_SUB_FOLDER_ID }}
+          HTML_FILE:            index.html
+
+          # MAGNETS
+          MAGNET_LINKS:         ${{ github.event.inputs.magnet_links        || '' }}
+
+          # EPISODES
+          EPISODE_OVERRIDE:     ${{ github.event.inputs.episode_override    || '' }}
+          NYAA_UPLOADER_URL:    ${{ github.event.inputs.nyaa_uploader_url   || '' }}
+          CUSTOM_SEARCH:        ${{ github.event.inputs.custom_search_query || '' }}
+          HS_TITLE_TPL:         ${{ github.event.inputs.ep_hs_title         || 'Detective Conan - {ep} HS' }}
+          SS_TITLE_TPL:         ${{ github.event.inputs.ep_ss_title         || 'Detective Conan - {ep} SS' }}
+
+          # MOVIES
+          MOVIE_MODE:           ${{ github.event.inputs.movie_mode          || '0' }}
+          MOVIE_HS_TITLE_TPL:   ${{ github.event.inputs.movie_hs_title      || 'Detective Conan Movie - {num} HS' }}
+          MOVIE_SS_TITLE_TPL:   ${{ github.event.inputs.movie_ss_title      || 'Detective Conan Movie - {num} SS' }}
