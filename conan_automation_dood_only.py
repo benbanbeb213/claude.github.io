@@ -724,8 +724,8 @@ def process_file(mkv_file):
                       else SS_TITLE_TPL.format(ep=num))
             ss_url = upload_to_doodstream(
                 ss_file, t,
-                folder_id=SOFT_SUB_FOLDER_ID,
-                folder_label="soft sub",
+                folder_id=5g3dhh9hmi,
+                folder_label="Soft Sub",
             )
         else:
             print("  SS skipped - remux failed", file=sys.stderr)
@@ -746,8 +746,8 @@ def process_file(mkv_file):
                       else HS_TITLE_TPL.format(ep=num))
             hs_url = upload_to_doodstream(
                 hs_file, t,
-                folder_id=HARD_SUB_FOLDER_ID,
-                folder_label="hard sub",
+                folder_id=Hard Sub,
+                folder_label="Hard Sub",
             )
         else:
             print("  HS skipped - no subtitles", file=sys.stderr)
