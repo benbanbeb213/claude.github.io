@@ -1,0 +1,68 @@
+name: Advanced Conan Automation
+
+on:
+  schedule:
+    # 7:00 AM Central Time (Standard Time) is 1:00 PM UTC
+    # 7:00 AM Central Time (Daylight Saving) is 12:00 PM UTC
+    # To cover both, let's start at 12:00 PM UTC every Saturday
+    - cron: '0 12 * * 6'
+  workflow_dispatch:
+    # Manual triggers for batch processing and selective file selection
+    inputs:
+      episode_range:
+        description: 'Episode Range (e.g., 1100-1105 or 1192)'
+        required: false
+        default: ''
+      search_query:
+        description: 'Custom Search Query (e.g., Detective Conan Movie 4)'
+        required: false
+        default: 'Detective Conan'
+      nyaa_user:
+        description: 'Nyaa User (e.g., subsplease, erai-raws)'
+        required: false
+        default: 'subsplease'
+      select_files:
+        description: 'File Indices to Download (e.g., 1,3,5)'
+        required: false
+        default: ''
+      hardsub_folder_id:
+        description: 'DoodStream Hard-sub Folder ID'
+        required: false
+        default: ''
+      softsub_folder_id:
+        description: 'DoodStream Soft-sub Folder ID'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240 # Extended for batch processing and retries
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y aria2 ffmpeg
+        pip install requests beautifulsoup4
+
+    - name: Run Advanced Downloader
+      env:
+        DOODSTREAM_API_KEY: ${{ secrets.DOODSTREAM_API_KEY }}
+        HARDSUB_FOLDER_ID: ${{ github.event.inputs.hardsub_folder_id || secrets.HARDSUB_FOLDER_ID }}
+        SOFTSUB_FOLDER_ID: ${{ github.event.inputs.softsub_folder_id || secrets.SOFTSUB_FOLDER_ID }}
+        EPISODE_RANGE: ${{ github.event.inputs.episode_range }}
+        SEARCH_QUERY: ${{ github.event.inputs.search_query || 'Detective Conan' }}
+        NYAA_USER: ${{ github.event.inputs.nyaa_user || 'subsplease' }}
+        SELECT_FILES: ${{ github.event.inputs.select_files }}
+        BASE_EPISODE: 1193
+        BASE_DATE: '2026-03-14'
+      run: python conan_automation_advanced.py
