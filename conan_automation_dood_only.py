@@ -1,9 +1,8 @@
 """
 conan_automation_dood_only.py - Detective Conan Single DoodStream Automation
 
-SS and HS both upload to DoodStream.
-Upload format: POST {server_url}?{API_KEY}  +  api_key in form data  (official API docs)
-Folder routing: upload to root first, then move to folder via /api/file/move
+Both SS and HS upload to DoodStream.
+Upload URL format: POST to upload_server_url?API_KEY  (original working format)
 
 Features:
   - Episode range: 1000 / 1000-1005 / 1000,1005 / 1000,1003-1005 / blank=auto
@@ -16,11 +15,10 @@ Features:
   - 6 Nyaa search strategies before giving up
   - SS: remux mkv->mp4 (stream copy, faststart, no re-encode)
   - HS: ffmpeg burn English subs, libx264 veryfast crf22
-  - Account verified once at startup, not per upload
   - Single git commit+push at end of entire run
   - Per-file error isolation - 1 failure never kills the batch
   - Upload retries x3 with fresh server URL each attempt
-  - Title set + folder move via DoodStream API after upload
+  - Title set via DoodStream rename API after upload
 """
 
 import os
@@ -60,7 +58,6 @@ SS_TITLE_TPL        = os.environ.get("SS_TITLE_TPL",       "Detective Conan - {e
 MOVIE_HS_TITLE_TPL  = os.environ.get("MOVIE_HS_TITLE_TPL", "Detective Conan Movie - {num} HS")
 MOVIE_SS_TITLE_TPL  = os.environ.get("MOVIE_SS_TITLE_TPL", "Detective Conan Movie - {num} SS")
 
-# Optional folder IDs - leave blank to upload to DoodStream root
 HARD_SUB_FOLDER_ID  = os.environ.get("HARD_SUB_FOLDER_ID", "thzdkzl93o").strip()
 SOFT_SUB_FOLDER_ID  = os.environ.get("SOFT_SUB_FOLDER_ID", "5g3dhh9hmi").strip()
 
@@ -77,7 +74,7 @@ SUB_MAP             = {}   # episode_number -> external subtitle file path
 # ==============================================================================
 
 def parse_file_info(filename):
-    """Returns (number, is_movie) detected from filename."""
+    """Returns (number, is_movie) from filename."""
     base = os.path.basename(filename)
 
     if MOVIE_MODE:
@@ -109,14 +106,6 @@ def get_auto_episode():
 
 
 def parse_episode_override(raw):
-    """
-    Parse episode range string into a deduplicated list.
-      1000          -> [1000]
-      1000-1005     -> [1000..1005]
-      1000,1005     -> [1000, 1005]
-      1000,1003-1005 -> [1000, 1003, 1004, 1005]
-      blank         -> [auto-calculated this week]
-    """
     raw = raw.strip()
     if not raw:
         return [get_auto_episode()]
@@ -150,7 +139,6 @@ def parse_episode_override(raw):
 
 
 def parse_select_files(raw):
-    """Parse torrent file selection string for aria2c --select-file."""
     raw = raw.strip()
     if not raw:
         return ""
@@ -177,7 +165,7 @@ def parse_select_files(raw):
 
 
 # ==============================================================================
-# NYAA SEARCH  (6 strategies, most specific to broadest)
+# NYAA SEARCH
 # ==============================================================================
 
 def _nyaa_magnets(url):
@@ -367,83 +355,82 @@ def build_subtitle_map(sub_files):
 
 
 # ==============================================================================
-# DOODSTREAM API
+# DOODSTREAM UPLOAD
 # ==============================================================================
 
-def _dood_get(endpoint, params):
-    """Make a GET request to DoodStream API. Returns parsed JSON or None."""
+def _get_upload_server():
+    if not DOODSTREAM_API_KEY:
+        print("  [DoodStream] Missing DOODSTREAM_API_KEY", file=sys.stderr)
+        return None
     try:
         resp = requests.get(
-            f"https://doodapi.co/api/{endpoint}",
-            params={"key": DOODSTREAM_API_KEY, **params},
-            timeout=15,
+            f"https://doodapi.co/api/upload/server?key={DOODSTREAM_API_KEY}",
+            timeout=20,
         ).json()
-        return resp
+        if resp.get("status") == 200:
+            return resp["result"]
+        print(f"  [DoodStream] Server error: {resp}", file=sys.stderr)
     except Exception as e:
-        print(f"  [DoodStream] API error ({endpoint}): {e}", file=sys.stderr)
-        return None
-
-
-def verify_account():
-    """
-    Verify the API key is valid by checking account info.
-    Called once at startup - not per upload.
-    Returns True if account is OK.
-    """
-    resp = _dood_get("account/info", {})
-    if resp and resp.get("status") == 200:
-        info  = resp.get("result") or {}
-        email = info.get("email", "unknown")
-        print(f"  [DoodStream] Account verified: {email}")
-        return True
-    print(f"  [DoodStream] Account verification failed: {resp}", file=sys.stderr)
-    return False
-
-
-def _get_upload_server():
-    """GET /api/upload/server -> returns the upload URL for this session."""
-    resp = _dood_get("upload/server", {})
-    if resp and resp.get("status") == 200:
-        return resp["result"]
-    print(f"  [DoodStream] Server error: {resp}", file=sys.stderr)
+        print(f"  [DoodStream] Server lookup failed: {e}", file=sys.stderr)
     return None
 
 
 def _rename_dood(file_code, title):
-    """Set file title via /api/file/rename."""
-    resp = _dood_get("file/rename", {"file_code": file_code, "title": title})
-    if resp and resp.get("status") == 200:
-        print(f"  [DoodStream] Title set: '{title}'")
-    else:
-        print(f"  [DoodStream] Rename error: {resp}", file=sys.stderr)
+    if not DOODSTREAM_API_KEY:
+        return
+    try:
+        resp = requests.get(
+            f"https://doodapi.co/api/file/rename"
+            f"?key={DOODSTREAM_API_KEY}"
+            f"&file_code={file_code}"
+            f"&title={requests.utils.quote(title)}",
+            timeout=15,
+        ).json()
+        if resp.get("status") == 200:
+            print(f"  [DoodStream] Title set: '{title}'")
+        else:
+            print(f"  [DoodStream] Rename error: {resp}", file=sys.stderr)
+    except Exception as e:
+        print(f"  [DoodStream] Rename failed: {e}", file=sys.stderr)
 
 
 def _move_dood(file_code, folder_id, label="file"):
-    """
-    Move an uploaded file to a folder via /api/file/move.
-    Called after upload succeeds - avoids the 'not allowed' error
-    that happens when sending fld_id directly to the upload endpoint.
-    Returns True on success, False on failure (non-fatal).
-    """
-    if not folder_id:
+    if not DOODSTREAM_API_KEY or not folder_id:
         return True
-    resp = _dood_get("file/move", {
-        "file_code": file_code,
-        "fld_id":    folder_id,
-    })
-    if resp and resp.get("status") == 200:
-        print(f"  [DoodStream] Moved {label} to folder {folder_id}")
-        return True
-    print(f"  [DoodStream] Move failed for {label}: {resp}", file=sys.stderr)
+    try:
+        resp = requests.get(
+            f"https://doodapi.co/api/file/move"
+            f"?key={DOODSTREAM_API_KEY}"
+            f"&file_code={file_code}"
+            f"&fld_id={folder_id}",
+            timeout=15,
+        ).json()
+        if resp.get("status") == 200:
+            print(f"  [DoodStream] Moved {label} to folder {folder_id}")
+            return True
+        print(f"  [DoodStream] Move error for {label}: {resp}", file=sys.stderr)
+    except Exception as e:
+        print(f"  [DoodStream] Move failed for {label}: {e}", file=sys.stderr)
     return False
 
 
-def _parse_upload_response(html):
-    """
-    DoodStream sometimes returns an HTML form instead of JSON.
-    Parse the textarea fields to extract the status message.
-    Returns a dict of {name: value} from textarea elements.
-    """
+def _get_dood_account_info():
+    if not DOODSTREAM_API_KEY:
+        return None
+    try:
+        resp = requests.get(
+            f"https://doodapi.co/api/account/info?key={DOODSTREAM_API_KEY}",
+            timeout=20,
+        ).json()
+        if resp.get("status") == 200:
+            return resp.get("result") or {}
+        print(f"  [DoodStream] Account info error: {resp}", file=sys.stderr)
+    except Exception as e:
+        print(f"  [DoodStream] Account lookup failed: {e}", file=sys.stderr)
+    return None
+
+
+def _parse_dood_html_upload_response(html):
     try:
         soup = BeautifulSoup(html, "html.parser")
         return {
@@ -455,19 +442,11 @@ def _parse_upload_response(html):
 
 
 def upload_to_doodstream(file_path, title, folder_id="", folder_label="file"):
-    """
-    Upload a file to DoodStream following the official API format:
+    """Upload file to DoodStream. Returns embed/download URL or None."""
+    if not DOODSTREAM_API_KEY:
+        print("  [DoodStream] DOODSTREAM_API_KEY is empty", file=sys.stderr)
+        return None
 
-      Step 1: GET /api/upload/server?key=KEY  -> get upload_url
-      Step 2: POST {upload_url}?{API_KEY}
-                   form: api_key=KEY
-                   file: file=<binary>
-      Step 3: POST /api/file/rename  -> set title
-      Step 4: GET  /api/file/move    -> move to folder (if folder_id set)
-
-    Moving happens AFTER upload (not during) to avoid 'not allowed' errors.
-    Returns the embed/download URL or None.
-    """
     size_mb = os.path.getsize(file_path) // (1024 * 1024)
     print(f"  [DoodStream] Uploading '{title}' ({size_mb} MB)...")
 
@@ -477,8 +456,6 @@ def upload_to_doodstream(file_path, title, folder_id="", folder_label="file"):
             print(f"  [DoodStream] No server (attempt {attempt})", file=sys.stderr)
             time.sleep(RETRY_DELAY)
             continue
-
-        print(f"  [DoodStream] Attempt {attempt} -> {server}")
 
         try:
             with open(file_path, "rb") as fh:
@@ -491,38 +468,29 @@ def upload_to_doodstream(file_path, title, folder_id="", folder_label="file"):
 
             print(f"  [DoodStream] HTTP {raw.status_code}")
 
-            # Try JSON first
-            resp = None
             try:
                 resp = raw.json()
             except Exception:
-                pass
-
-            # Fall back to HTML form parser
-            if resp is None:
-                parsed    = _parse_upload_response(raw.text)
-                st        = parsed.get("st", "")
-                if st:
-                    print(f"  [DoodStream] Server message: {st}", file=sys.stderr)
-                    if "not allowed to upload" in st.lower():
-                        # This means the API key itself is blocked on this node.
-                        # No point retrying - fail immediately.
+                parsed = _parse_dood_html_upload_response(raw.text)
+                status_text = parsed.get("st", "")
+                if status_text:
+                    print(f"  [DoodStream] Upload server message: {status_text}", file=sys.stderr)
+                    if "not allowed to upload files" in status_text.lower():
                         print(
-                            "  [DoodStream] Account not allowed to upload. "
-                            "Check your API key is correct in the DOODSTREAM_API_KEY secret.",
+                            "  [DoodStream] Your DoodStream account/API key is reaching the upload server, but that account is not allowed to upload files.",
                             file=sys.stderr,
                         )
                         return None
                 else:
-                    print(f"  [DoodStream] Non-JSON: {raw.text[:300]}", file=sys.stderr)
+                    print(f"  [DoodStream] Non-JSON response: {raw.text[:500]}", file=sys.stderr)
                 if attempt < UPLOAD_RETRIES:
                     time.sleep(RETRY_DELAY)
                 continue
 
             if resp.get("status") == 200:
-                result    = resp["result"][0]
+                result = resp["result"][0]
                 file_code = result.get("file_code") or result.get("filecode") or ""
-                url       = (
+                url = (
                     result.get("protected_embed")
                     or result.get("embed_url")
                     or result.get("download_url")
@@ -531,12 +499,12 @@ def upload_to_doodstream(file_path, title, folder_id="", folder_label="file"):
                 )
                 if file_code:
                     _rename_dood(file_code, title)
-                    _move_dood(file_code, folder_id, folder_label)
+                    if folder_id:
+                        _move_dood(file_code, folder_id, folder_label)
                 print(f"  [DoodStream] Uploaded: {url}")
                 return url
 
-            print(f"  [DoodStream] Bad response (attempt {attempt}): {resp}",
-                  file=sys.stderr)
+            print(f"  [DoodStream] Bad response (attempt {attempt}): {resp}", file=sys.stderr)
 
         except Exception as e:
             print(f"  [DoodStream] Exception (attempt {attempt}): {e}", file=sys.stderr)
@@ -545,17 +513,14 @@ def upload_to_doodstream(file_path, title, folder_id="", folder_label="file"):
             print(f"  [DoodStream] Retrying in {RETRY_DELAY}s...")
             time.sleep(RETRY_DELAY)
 
-    print(f"  [DoodStream] All {UPLOAD_RETRIES} attempts failed for '{title}'",
-          file=sys.stderr)
+    print(f"  [DoodStream] All {UPLOAD_RETRIES} attempts failed for '{title}'", file=sys.stderr)
     return None
-
 
 # ==============================================================================
 # FFMPEG
 # ==============================================================================
 
 def _esc(path):
-    """Escape a path for use in ffmpeg subtitles= filter."""
     p = path.replace("\\", "\\\\").replace("'", "\\'")
     return p.replace(":", "\\:").replace("[", "\\[").replace("]", "\\]")
 
@@ -563,9 +528,9 @@ def _esc(path):
 def remux_to_mp4(input_file, label):
     """
     Remux .mkv -> .mp4 for SS upload.
-      - Drops subtitles (ASS/SSA cannot go into MP4 container)
-      - -movflags +faststart puts moov atom at front (required by DoodStream)
-      - Three attempts: stream copy -> audio re-encode -> full re-encode
+    - Drops subtitles (ASS cannot go into MP4)
+    - Uses -movflags +faststart (moov atom at front, required by DoodStream)
+    - Three attempts: stream copy first, then audio re-encode, then full re-encode
     """
     output = f"conan_{label}_ss.mp4"
     if os.path.exists(output):
@@ -574,10 +539,10 @@ def remux_to_mp4(input_file, label):
     print(f"  Remuxing -> {output}")
 
     attempts = [
-        ("stream copy",             ["-c:v", "copy", "-c:a", "copy"]),
-        ("copy video + AAC audio",  ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]),
-        ("full re-encode H264+AAC", ["-c:v", "libx264", "-preset", "veryfast",
-                                     "-crf", "22", "-c:a", "aac", "-b:a", "192k"]),
+        ("stream copy",              ["-c:v", "copy", "-c:a", "copy"]),
+        ("copy video + AAC audio",   ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]),
+        ("full re-encode H264+AAC",  ["-c:v", "libx264", "-preset", "veryfast",
+                                      "-crf", "22", "-c:a", "aac", "-b:a", "192k"]),
     ]
 
     for desc, codec_flags in attempts:
@@ -600,9 +565,9 @@ def remux_to_mp4(input_file, label):
 
 def _find_english_sub_index(input_file):
     """
-    Returns 0-based subtitle stream index of the English track.
-    Returns -1 if file has NO subtitle streams at all (caller skips HS).
-    Returns  0 as fallback if streams exist but none tagged English.
+    Returns the 0-based subtitle stream index of the English track.
+    Returns -1 if the file has NO subtitle streams at all (skip HS).
+    Returns  0 as fallback if streams exist but none are tagged English.
     """
     try:
         r = subprocess.run(
@@ -639,23 +604,22 @@ def _find_english_sub_index(input_file):
 def hardsub(input_file, label, external_sub=None):
     """
     Burn subtitles into video.
-      - Uses external_sub (.srt/.ass) if provided
-      - Otherwise scans embedded subtitle streams via ffprobe
-      - Returns None if no subtitles available at all
+    Uses external_sub if provided, otherwise scans embedded streams.
+    Returns None if no subtitles available.
     Output: conan_{label}_hs.mp4
     """
     output = f"conan_{label}_hs.mp4"
 
     if external_sub:
         print(f"  [ffmpeg] External sub: {os.path.basename(external_sub)}")
-        esc     = _esc(external_sub)
+        esc = _esc(external_sub)
         vf_list = [f"subtitles='{esc}'", f"subtitles={esc}"]
     else:
         idx = _find_english_sub_index(input_file)
         if idx == -1:
             print("  [ffmpeg] No subtitle streams - skipping HS", file=sys.stderr)
             return None
-        esc     = _esc(input_file)
+        esc = _esc(input_file)
         print(f"  [ffmpeg] Embedded sub index {idx}")
         vf_list = [
             f"subtitles='{esc}':si={idx}",
@@ -693,10 +657,7 @@ def hardsub(input_file, label, external_sub=None):
 # ==============================================================================
 
 def process_file(mkv_file):
-    """
-    Process one .mkv: SS + HS -> DoodStream.
-    Returns (num, is_movie, hs_url, ss_url). Never raises.
-    """
+    """Process one .mkv: SS + HS -> DoodStream. Returns (num, is_movie, hs_url, ss_url)."""
     num, is_movie = parse_file_info(mkv_file)
     if num is None:
         num      = get_auto_episode()
@@ -716,14 +677,15 @@ def process_file(mkv_file):
     if ext_sub:
         print(f"  External sub matched: {os.path.basename(ext_sub)}")
 
-    # -- SS: remux mkv->mp4 -> upload -> move to soft-sub folder -----------
+    # -- SS: remux -> DoodStream -------------------------------------------
     try:
         ss_file = remux_to_mp4(mkv_file, label)
         if ss_file:
             t      = (MOVIE_SS_TITLE_TPL.format(num=num) if is_movie
                       else SS_TITLE_TPL.format(ep=num))
             ss_url = upload_to_doodstream(
-                ss_file, t,
+                ss_file,
+                t,
                 folder_id=SOFT_SUB_FOLDER_ID,
                 folder_label="soft sub",
             )
@@ -733,19 +695,18 @@ def process_file(mkv_file):
         print(f"  SS exception: {e}", file=sys.stderr)
     finally:
         if ss_file and os.path.exists(ss_file):
-            try:
-                os.remove(ss_file)
-            except OSError:
-                pass
+            try: os.remove(ss_file)
+            except OSError: pass
 
-    # -- HS: burn subs -> upload -> move to hard-sub folder ----------------
+    # -- HS: burn subs -> DoodStream ---------------------------------------
     try:
         hs_file = hardsub(mkv_file, label, external_sub=ext_sub)
         if hs_file:
             t      = (MOVIE_HS_TITLE_TPL.format(num=num) if is_movie
                       else HS_TITLE_TPL.format(ep=num))
             hs_url = upload_to_doodstream(
-                hs_file, t,
+                hs_file,
+                t,
                 folder_id=HARD_SUB_FOLDER_ID,
                 folder_label="hard sub",
             )
@@ -755,15 +716,11 @@ def process_file(mkv_file):
         print(f"  HS exception: {e}", file=sys.stderr)
     finally:
         if hs_file and os.path.exists(hs_file):
-            try:
-                os.remove(hs_file)
-            except OSError:
-                pass
+            try: os.remove(hs_file)
+            except OSError: pass
 
-    try:
-        os.remove(mkv_file)
-    except OSError:
-        pass
+    try: os.remove(mkv_file)
+    except OSError: pass
 
     return num, is_movie, hs_url, ss_url
 
@@ -819,23 +776,16 @@ def parse_magnet_list(raw):
 
 
 def main():
-    # -- Validate API key before doing anything ----------------------------
     if not DOODSTREAM_API_KEY:
-        print("ERROR: DOODSTREAM_API_KEY is not set.", file=sys.stderr)
+        print("ERROR: Set DOODSTREAM_API_KEY before running.", file=sys.stderr)
         sys.exit(1)
-
-    print("Verifying DoodStream account...")
-    if not verify_account():
-        print("ERROR: DoodStream API key is invalid or account unreachable.",
-              file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Soft-sub folder: {SOFT_SUB_FOLDER_ID or 'root (no folder set)'}")
-    print(f"Hard-sub folder: {HARD_SUB_FOLDER_ID or 'root (no folder set)'}")
 
     global SUB_MAP
     all_mkv  = []
     all_subs = []
+
+    print(f"Soft-sub folder ID: {SOFT_SUB_FOLDER_ID or 'root'}")
+    print(f"Hard-sub folder ID: {HARD_SUB_FOLDER_ID or 'root'}")
 
     # -- Step 0: download subtitle magnet first (if provided) ---------------
     if SUBTITLE_MAGNET:
@@ -857,7 +807,7 @@ def main():
                 all_mkv.extend(files)
                 all_subs.extend(subs)
 
-    # -- Source B: Nyaa auto-search by episode ------------------------------
+    # -- Source B: Nyaa search by episode -----------------------------------
     else:
         episodes = parse_episode_override(EPISODE_OVERRIDE)
         if not EPISODE_OVERRIDE.strip():
@@ -889,7 +839,7 @@ def main():
     if all_subs:
         SUB_MAP = build_subtitle_map(all_subs)
 
-    # -- Process all files --------------------------------------------------
+    # -- Process ------------------------------------------------------------
     print(f"\nProcessing {len(all_mkv)} file(s)...")
     results = []
     for i, mkv in enumerate(all_mkv, 1):
@@ -901,7 +851,6 @@ def main():
         except Exception as e:
             print(f"  FATAL: {e}", file=sys.stderr)
 
-    # -- Patch HTML + single git push for the whole batch ------------------
     if results:
         changed = patch_html_batch(results)
         if changed:
