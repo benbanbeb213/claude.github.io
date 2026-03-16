@@ -1,0 +1,105 @@
+name: Advanced Conan Automation Pro
+
+on:
+  schedule:
+    # Runs at 7:30 AM Central Daylight Time (CDT) every Saturday.
+    # CDT is UTC-5, so 7:30 AM CDT is 12:30 PM UTC.
+    - cron: '30 12 * * 6'
+  workflow_dispatch:
+    inputs:
+      episode_input:
+        description: 'Episode(s) to process (e.g., 1100, 1100-1105, 1100,1103-1105)'
+        required: false
+        default: ''
+      magnet_links_input:
+        description: 'Comma or newline separated magnet links for direct download'
+        required: false
+        default: ''
+        type: string
+      nyaa_user:
+        description: 'Nyaa uploader (e.g., erai-raws, subsplease)'
+        required: false
+        default: 'erai-raws'
+      search_query_override:
+        description: 'Custom search query for Nyaa (e.g., Detective Conan Movie 4)'
+        required: false
+        default: ''
+      select_files:
+        description: 'Aria2c file indices to download (e.g., 1,3,5 or 1-5)'
+        required: false
+        default: ''
+      force_movie_mode:
+        description: 'Force processing as a movie/OVA (true/false)'
+        required: false
+        default: 'false'
+        type: boolean
+      hardsub_folder_id:
+        description: 'DoodStream Folder ID for Hard-subbed videos (overrides default)'
+        required: false
+        default: ''
+      softsub_folder_id:
+        description: 'DoodStream Folder ID for Soft-subbed videos (overrides default)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # 6 hours for extensive batch processing and retries
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0 # Fetch all history for git operations
+
+    - name: Disk Cleanup (Free up ~30GB)
+      run: |
+        echo "Freeing up disk space..."
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo apt-get clean
+        df -h
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y aria2 ffmpeg ffprobe # ffprobe is part of ffmpeg package
+        pip install requests beautifulsoup4
+
+    - name: Run Advanced Downloader
+      env:
+        DOODSTREAM_API_KEY: ${{ secrets.DOODSTREAM_API_KEY }}
+        HARDSUB_FOLDER_ID: ${{ inputs.hardsub_folder_id || secrets.HARDSUB_FOLDER_ID || 'thzdkzl93o' }}
+        SOFTSUB_FOLDER_ID: ${{ inputs.softsub_folder_id || secrets.SOFTSUB_FOLDER_ID || '5g3dhh9hmi' }}
+        EPISODE_INPUT: ${{ inputs.episode_input }}
+        MAGNET_LINKS_INPUT: ${{ inputs.magnet_links_input }}
+        NYAA_USER: ${{ inputs.nyaa_user }}
+        SEARCH_QUERY_OVERRIDE: ${{ inputs.search_query_override }}
+        SELECT_FILES: ${{ inputs.select_files }}
+        FORCE_MOVIE_MODE: ${{ inputs.force_movie_mode }}
+        BASE_EPISODE: 1193
+        BASE_DATE: '2026-03-14'
+      run: python conan_pro.py
+
+    - name: Configure Git for Commit
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Commit and Push Changes (if any)
+      run: |
+        git add . # Add any new files or changes (e.g., logs, temp files if not cleaned)
+        git diff --quiet && git diff --staged --quiet || (
+          git commit -m "Automated run: Update logs or generated files"
+          git pull --rebase # Ensure latest changes before pushing
+          git push
+        )
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
